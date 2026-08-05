@@ -1,0 +1,42 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api.local
+      args:
+        EXTRAS: "api,runtime"
+    image: llm-metadata-harvester-service-api:prod
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker.local
+      args:
+        EXTRAS: "runtime"
+    image: llm-metadata-harvester-service-worker:prod
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.local.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+    restart: unless-stopped

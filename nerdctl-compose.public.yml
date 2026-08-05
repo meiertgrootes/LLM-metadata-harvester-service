@@ -2,13 +2,10 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    networks:
+      - internal
 
   api:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api.prod
-      args:
-        EXTRAS: "api,runtime"
     image: llm-metadata-harvester-service-api:prod
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -16,13 +13,10 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    networks:
+      - internal
 
   worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker.prod
-      args:
-        EXTRAS: "runtime"
     image: llm-metadata-harvester-service-worker:prod
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -30,13 +24,26 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    networks:
+      - internal
 
   nginx:
     image: nginx:1.25-alpine
     ports:
       - "80:80"
+      # future TLS
+      # - "443:443"
     volumes:
-      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/nginx.public.conf:/etc/nginx/nginx.conf:ro
+     # - ./certs:/etc/nginx/certs:ro            <-- certificates must be placed and loaded 
     depends_on:
       - api
     restart: unless-stopped
+    networks:
+      - internal
+      - public
+
+networks:
+  internal:
+    internal: true
+  public:
