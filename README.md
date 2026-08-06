@@ -59,6 +59,8 @@ delete
 ## Installation
 The service is provided in a fully containerized format and can be deployed using either docker or nerdctl/containerd. There are 3 deployment modes available: `dev` (development), `local` (local production), and `public` (hardend production for public facing deployment).
 
+The service persists submitted jobs and their results in a PostgreSQL database, which is started automatically as part of each deployment track. Redis is used only as the Celery broker (task queue); completed results are stored in the database and remain retrievable indefinitely.
+
 
 To run the service in local production mode users should follow the steps listed below
 1. Ensure either `Docker` or `nerdctl/containerd` is available on their system.
@@ -215,7 +217,57 @@ python scripts/webhook_receiver.py   # listens on http://localhost:8080
 
 then submit jobs with `"webhook_url": "http://localhost:8080/"` (and, if used, `WEBHOOK_RECEIVER_SECRET` matching `webhook_secret`). Public test endpoints such as <https://webhook.site> can also be used.
 
-> **Note for the `public` deployment track:** webhook delivery is performed by the worker container, which requires outbound internet access. The `nerdctl-compose.public.yml` attaches the worker to the `public` network for this purpose.
+> **Note for the `public` deployment track:** webhook delivery is performed by the worker container, which requires outbound internet access. The `nerdctl-compose.public.yml` attaches the worker to the `public` network for this purpose. Operators should also override the default PostgreSQL credentials (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` environment variables) for the `public` track.
+
+## Batch submission
+
+A batch of URLs can be submitted in a single request. Each URL becomes its own job with its own `job_id` and its own result (no concatenated result object), so every URL's result can be retrieved individually.
+
+### Submitting a batch
+
+```bash
+curl -X POST "http://localhost/jobs/batch/" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <InsertYourAPIKeyHere>" \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "urls": [
+      "https://example.com",
+      "https://example.org",
+      "https://example.net"
+    ],
+    "webhook_url": "https://your-app.example.com/webhooks/metadata-harvest"
+  }'
+```
+
+which returns a `batch_id` plus the per-URL `job_id` mapping:
+
+```json
+{
+  "batch_id": "9f2c1b3e-...",
+  "status": "queued",
+  "count": 3,
+  "jobs": [
+    {"job_id": "aaaa...", "url": "https://example.com", "status": "queued"},
+    {"job_id": "bbbb...", "url": "https://example.org", "status": "queued"},
+    {"job_id": "cccc...", "url": "https://example.net", "status": "queued"}
+  ]
+}
+```
+
+Batches are limited to `BATCH_MAX_URLS` URLs (default 100).
+
+### Monitoring and retrieving a batch
+
+- Overall status: `curl -s http://localhost/batches/$BATCH_ID`
+- Full per-job results: `curl -s http://localhost/batches/$BATCH_ID/results`
+
+Each job can also be monitored and retrieved individually as before:
+
+- `curl -s http://localhost/jobs/$JOB_ID`
+- `curl -s http://localhost/jobs/$JOB_ID/result`
+
+
 
 <!---
 - _description of what the software does_

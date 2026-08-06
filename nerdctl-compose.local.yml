@@ -3,6 +3,21 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: harvester
+      POSTGRES_PASSWORD: harvester
+      POSTGRES_DB: harvester
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harvester -d harvester"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   api:
     build:
       context: .
@@ -12,9 +27,12 @@ services:
     image: llm-metadata-harvester-service-api:prod
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   worker:
@@ -26,9 +44,12 @@ services:
     image: llm-metadata-harvester-service-worker:prod
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   nginx:
@@ -40,3 +61,6 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+volumes:
+  pgdata:
