@@ -4,7 +4,7 @@ import subprocess
 from watchfiles import run_process
 
 
-def start():
+def start() -> None:
     subprocess.run([
         "celery",
         "-A",

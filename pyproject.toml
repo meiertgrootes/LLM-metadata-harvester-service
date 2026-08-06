@@ -26,6 +26,8 @@ runtime = [
   "celery>=5.3",
   "redis>=5.0",
   "httpx>=0.27",
+  "sqlalchemy>=2.0",
+  "psycopg2-binary>=2.9",
 ]
 
 
@@ -40,12 +42,6 @@ api = [
 worker = [
   "celery>=5.3",
   "redis>=5.0",
-]
-
-# ---- Database support (optional) ----
-postgres = [
-  "sqlalchemy>=2.0",
-  "psycopg2-binary>=2.9",
 ]
 
 # ---- Development tooling ----
