@@ -26,6 +26,8 @@ services:
     restart: unless-stopped
     networks:
       - internal
+      # public network is required for outbound webhook delivery; no inbound ports are exposed
+      - public
 
   nginx:
     image: nginx:1.25-alpine

@@ -1,5 +1,8 @@
-from celery import Celery
 import os
+
+from celery import Celery
+
+from llm_metadata_harvester_service.core.config import RESULT_EXPIRES_SECONDS
 
 broker_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 result_backend = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
@@ -17,7 +20,7 @@ celery_app.autodiscover_tasks(
     ]
 )
 
-celery_app.conf.result_expires = 3600  # 1 hour
+celery_app.conf.result_expires = RESULT_EXPIRES_SECONDS
 
 celery_app.conf.update(
     task_serializer="json",

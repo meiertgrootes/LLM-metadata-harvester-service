@@ -149,6 +149,74 @@ which returns
   {"job_id":"1a62b30e-faaa-4641-b1d0-66081c162b2e","status":"success","model":"gemini-2.5-flash","result":{"Metadata date":"N/A;","Metadata language":"English;","Responsible     organization metadata":"N/A;","Landing page":"N/A;","Title":"Example Domain;","Description":"For use in documentation examples without needing permission and should be avoided in operations.;","Unique Identifier":"N/A;","Resource type":"Conceptual or example resource;","Keywords":"documentation examples, permission, operations;","Data creator":"N/A;","Data contact point":"N/A;","Data publisher":"N/A;","Spatial coverage":"N/A;","Spatial resolution":"N/A;","Spatial reference system":"N/A;","Temporal coverage":"N/A;","Temporal resolution":"N/A;","License":"Permissive license for use in documentation examples without needing permission;","Access rights":"Allow use in documentation examples without requiring permission;","Distribution access URL":"N/A;","Distribution format":"N/A;","Distribution byte size":"N/A;"},"logs":"Extracting full page text...\nExtracting entities from text...\nConverting extracted nodes to metadata...\n"}
 ```
 
+## Webhooks
+
+Instead of polling the status/result endpoints, a client can provide a `webhook_url` at submission time. The service will `POST` the full result payload to that URL once the job completes or fails.
+
+### Submitting a job with a webhook
+
+```bash
+curl -X POST "http://localhost/jobs/" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <InsertYourAPIKeyHere>" \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "url": "https://example.com",
+    "webhook_url": "https://your-app.example.com/webhooks/metadata-harvest",
+    "webhook_secret": "<a-random-secret-of-at-least-16-characters>"
+  }'
+```
+
+The `webhook_secret` is optional. When provided it is used to HMAC-SHA256 sign the payload so the receiver can verify the notification genuinely came from this service. The service will only ever send to `http://`/`https://` URLs.
+
+### Webhook payload
+
+The body of the `POST` request is JSON:
+
+```json
+{
+  "event": "job.completed",
+  "timestamp": "2026-02-04T12:00:00+00:00",
+  "job_id": "1a62b30e-faaa-4641-b1d0-66081c162b2e",
+  "status": "success",
+  "model": "gemini-2.5-flash",
+  "result": { },
+  "logs": "Extracting full page text...\n",
+  "error": null
+}
+```
+
+- `event` is `job.completed` on success or `job.failed` on failure.
+- On failure `result` is `null` and `error` holds a short error code (currently `harvest_failed`); detailed logs are in `logs`.
+- A receiver should reply with `2xx` to acknowledge delivery. Delivery is retried with exponential backoff (about 2s to 32s, 5 attempts) on non-2xx responses or connection errors, honouring a `Retry-After` header when present.
+
+### Verifying the signature
+
+When `webhook_secret` was set, the request carries a `X-Webhook-Signature` header of the form `sha256=<hex>`. The signature is the HMAC-SHA256 digest of the raw request body, keyed with the secret:
+
+```bash
+# receiver-side example (node):
+const crypto = require("crypto");
+const body = await readRawRequestBody(); // must be the exact raw bytes
+const expected = crypto
+  .createHmac("sha256", process.env.WEBHOOK_SECRET)
+  .update(body)
+  .digest("hex");
+// compare `sha256=${expected}` with the X-Webhook-Signature header
+```
+
+### Testing webhooks
+
+For local development a small receiver is provided:
+
+```bash
+python scripts/webhook_receiver.py   # listens on http://localhost:8080
+```
+
+then submit jobs with `"webhook_url": "http://localhost:8080/"` (and, if used, `WEBHOOK_RECEIVER_SECRET` matching `webhook_secret`). Public test endpoints such as <https://webhook.site> can also be used.
+
+> **Note for the `public` deployment track:** webhook delivery is performed by the worker container, which requires outbound internet access. The `nerdctl-compose.public.yml` attaches the worker to the `public` network for this purpose.
+
 <!---
 - _description of what the software does_
 - _notes on how to install_

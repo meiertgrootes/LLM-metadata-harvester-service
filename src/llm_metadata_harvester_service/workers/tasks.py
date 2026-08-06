@@ -1,18 +1,29 @@
 # src/llm_metadata_harvester_service/workers/tasks.py
 
-from celery import shared_task
-import io
-import sys
-import json
-import traceback
 import asyncio
+import io
+import json
+import sys
+import traceback
 from contextlib import redirect_stdout
+from typing import Any
 
+from celery import shared_task
 from llm_metadata_harvester.harvester_operations import metadata_harvest
+
+from llm_metadata_harvester_service.workers.webhook import dispatch_webhook
 
 
 @shared_task(bind=True)
-def run_harvester_task(self, *, model: str, url: str, api_key: str):
+def run_harvester_task(
+    self: Any,
+    *,
+    model: str,
+    url: str,
+    api_key: str,
+    webhook_url: str | None = None,
+    webhook_secret: str | None = None,
+) -> dict[str, Any]:
     stdout_buffer = io.StringIO()
 
     try:
@@ -28,14 +39,25 @@ def run_harvester_task(self, *, model: str, url: str, api_key: str):
         logs = stdout_buffer.getvalue()
 
         payload = {
+            "job_id": self.request.id,
+            "status": "success",
             "model": model,
             "result": result,
             "logs": logs,
+            "error": None,
         }
 
         # Operator visibility (optional)
         sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+
+        if webhook_url:
+            dispatch_webhook.delay(
+                payload=payload,
+                webhook_url=webhook_url,
+                webhook_secret=webhook_secret,
+                event="job.completed",
+            )
 
         return payload
 
@@ -43,6 +65,8 @@ def run_harvester_task(self, *, model: str, url: str, api_key: str):
         error_logs = stdout_buffer.getvalue() + "\n" + traceback.format_exc()
 
         payload = {
+            "job_id": self.request.id,
+            "status": "failure",
             "model": model,
             "result": None,
             "logs": error_logs,
@@ -51,5 +75,13 @@ def run_harvester_task(self, *, model: str, url: str, api_key: str):
 
         sys.stderr.write(json.dumps(payload) + "\n")
         sys.stderr.flush()
+
+        if webhook_url:
+            dispatch_webhook.delay(
+                payload=payload,
+                webhook_url=webhook_url,
+                webhook_secret=webhook_secret,
+                event="job.failed",
+            )
 
         raise
