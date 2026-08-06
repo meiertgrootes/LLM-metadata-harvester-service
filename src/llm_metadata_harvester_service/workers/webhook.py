@@ -10,12 +10,15 @@ from urllib.parse import urlparse
 
 import httpx
 from celery import shared_task
+from celery.exceptions import Retry
 
 from llm_metadata_harvester_service.core.config import (
     WEBHOOK_MAX_RETRIES,
     WEBHOOK_RETRY_BACKOFF,
     WEBHOOK_TIMEOUT_SECONDS,
 )
+from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,35 @@ def _build_body(event: str, payload: dict[str, Any]) -> bytes:
         **payload,
     }
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def _record_attempt(job_id: str) -> None:
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            return
+        job.webhook_attempts = (job.webhook_attempts or 0) + 1
+        job.webhook_last_attempt_at = datetime.now(UTC)
+        db.commit()
+
+
+def _record_delivered(job_id: str) -> None:
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            return
+        job.webhook_delivered_at = datetime.now(UTC)
+        job.webhook_error = None
+        db.commit()
+
+
+def _record_failed(job_id: str, error: str) -> None:
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            return
+        job.webhook_error = error
+        db.commit()
 
 
 @shared_task(
@@ -58,14 +90,40 @@ def dispatch_webhook(
     The body is HMAC-SHA256 signed when a ``webhook_secret`` was provided at
     submission time. Delivery is retried with exponential backoff on transient
     HTTP errors and non-2xx responses, honouring ``Retry-After`` when present.
+    Delivery metadata is recorded on the job row (best-effort; database
+    failures never block delivery).
     """
-    _deliver(
-        self,
-        payload=payload,
-        webhook_url=webhook_url,
-        webhook_secret=webhook_secret,
-        event=event,
-    )
+    job_id = payload["job_id"]
+
+    try:
+        _record_attempt(job_id)
+    except Exception:
+        logger.warning("could not record webhook attempt for %s", job_id, exc_info=True)
+
+    try:
+        delivered = _deliver(
+            self,
+            payload=payload,
+            webhook_url=webhook_url,
+            webhook_secret=webhook_secret,
+            event=event,
+        )
+    except Retry:
+        raise
+    except Exception as exc:
+        try:
+            _record_failed(job_id, str(exc))
+        except Exception:
+            logger.warning("could not record webhook failure for %s", job_id, exc_info=True)
+        raise
+
+    try:
+        if delivered:
+            _record_delivered(job_id)
+        else:
+            _record_failed(job_id, "delivery failed permanently")
+    except Exception:
+        logger.warning("could not record webhook outcome for %s", job_id, exc_info=True)
 
 
 def _deliver(
@@ -75,7 +133,9 @@ def _deliver(
     webhook_url: str,
     webhook_secret: str | None,
     event: str,
-) -> None:
+) -> bool:
+    """Attempt one webhook delivery. Returns True when delivered, False when the
+    final attempt failed; raises ``Retry`` to schedule another attempt."""
     scheme = urlparse(webhook_url).scheme
     if scheme not in ("http", "https"):
         raise ValueError(f"Unsupported webhook URL scheme: {scheme!r}")
@@ -99,7 +159,7 @@ def _deliver(
                 event,
                 exc,
             )
-            return
+            return False
         raise self.retry(exc=exc) from exc
 
     if response.status_code >= 400:
@@ -118,7 +178,7 @@ def _deliver(
                 event,
                 response.status_code,
             )
-            return
+            return False
 
         logger.warning(
             "webhook delivery failed (attempt %s/%s) for %s: HTTP %s",
@@ -137,3 +197,4 @@ def _deliver(
         )
 
     logger.info("webhook delivered to %s (event=%s)", webhook_url, event)
+    return True
