@@ -1,2 +1,5 @@
 lima_apptainer_nerdctl.yaml
 
+__pycache__/
+*.pyc
+
