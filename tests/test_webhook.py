@@ -8,9 +8,14 @@ import httpx
 import pytest
 from celery.exceptions import Retry
 
+from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.workers.webhook import (
     _build_body,
     _deliver,
+    _record_attempt,
+    _record_delivered,
+    _record_failed,
     sign_payload,
 )
 
@@ -68,7 +73,7 @@ def test_dispatch_success_posts_signed_payload(monkeypatch):
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
 
-    _deliver(
+    delivered = _deliver(
         _fake_self(),
         payload=PAYLOAD,
         webhook_url=WEBHOOK_URL,
@@ -76,6 +81,7 @@ def test_dispatch_success_posts_signed_payload(monkeypatch):
         event="job.completed",
     )
 
+    assert delivered is True
     assert captured["url"] == WEBHOOK_URL
     assert captured["timeout"] == 10.0
     assert captured["headers"]["X-Webhook-Signature"] == (
@@ -105,7 +111,7 @@ def test_dispatch_without_secret_sets_no_signature(monkeypatch):
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
 
-    _deliver(
+    delivered = _deliver(
         _fake_self(),
         payload=PAYLOAD,
         webhook_url=WEBHOOK_URL,
@@ -113,6 +119,7 @@ def test_dispatch_without_secret_sets_no_signature(monkeypatch):
         event="job.completed",
     )
 
+    assert delivered is True
     assert "X-Webhook-Signature" not in captured["headers"]
 
 
@@ -162,13 +169,14 @@ def test_dispatch_gives_up_after_final_connection_error(monkeypatch):
     monkeypatch.setattr(httpx, "Client", BoomClient)
 
     self = _fake_self(retries=5, max_retries=5)
-    _deliver(
+    delivered = _deliver(
         self,
         payload=PAYLOAD,
         webhook_url=WEBHOOK_URL,
         webhook_secret=SECRET,
         event="job.completed",
     )
+    assert delivered is False
     self.retry.assert_not_called()
 
 
@@ -264,13 +272,14 @@ def test_dispatch_gives_up_after_final_non_2xx(monkeypatch):
     monkeypatch.setattr(httpx, "Client", FiveClient)
 
     self = _fake_self(retries=5, max_retries=5)
-    _deliver(
+    delivered = _deliver(
         self,
         payload=PAYLOAD,
         webhook_url=WEBHOOK_URL,
         webhook_secret=SECRET,
         event="job.completed",
     )
+    assert delivered is False
     self.retry.assert_not_called()
 
 
@@ -283,3 +292,33 @@ def test_dispatch_rejects_unsupported_scheme():
             webhook_secret=None,
             event="job.completed",
         )
+
+
+def test_record_delivery_metadata():
+    job_id = "job-meta"
+    with SessionLocal() as db:
+        db.add(Job(job_id=job_id, model="m", url="https://x.example", status="queued"))
+        db.commit()
+
+    _record_attempt(job_id)
+    _record_attempt(job_id)
+    _record_delivered(job_id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.webhook_attempts == 2
+        assert job.webhook_last_attempt_at is not None
+        assert job.webhook_delivered_at is not None
+        assert job.webhook_error is None
+
+    _record_failed(job_id, "delivery failed permanently")
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.webhook_error == "delivery failed permanently"
+
+
+def test_record_delivery_metadata_missing_job_is_noop():
+    _record_attempt("nope")
+    _record_delivered("nope")
+    _record_failed("nope", "boom")

@@ -1,6 +1,14 @@
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
+
+# Configure the database and broker BEFORE importing the application, so the
+# engine is created against a throwaway SQLite file rather than PostgreSQL.
+_TMPDIR = tempfile.mkdtemp(prefix="llm-harvester-tests-")
+os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDIR}/test.db"
+os.environ["CELERY_BROKER_URL"] = "memory://"
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
@@ -20,3 +28,19 @@ harvester.harvester_operations = harvester_ops
 
 sys.modules.setdefault("llm_metadata_harvester", harvester)
 sys.modules.setdefault("llm_metadata_harvester.harvester_operations", harvester_ops)
+
+import pytest  # noqa: E402
+
+from llm_metadata_harvester_service.db.init import init_db  # noqa: E402
+from llm_metadata_harvester_service.db.session import Base, SessionLocal  # noqa: E402
+
+init_db()
+
+
+@pytest.fixture(autouse=True)
+def _clean_tables():
+    yield
+    with SessionLocal() as db:
+        for table in reversed(Base.metadata.sorted_tables):
+            db.execute(table.delete())
+        db.commit()

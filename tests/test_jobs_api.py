@@ -1,8 +1,11 @@
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
 
 from llm_metadata_harvester_service.api import routes
+from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.main import app
 
 client = TestClient(app)
@@ -15,85 +18,71 @@ class FakeTask:
 
 
 class FakeTaskRunner:
-    def __init__(self, captured, job_id):
-        self.captured = captured
-        self.job_id = job_id
+    def __init__(self):
+        self.calls = []
 
-    def delay(self, *, model, url, api_key, webhook_url, webhook_secret):
-        self.captured.update(
-            model=model,
-            url=url,
-            api_key=api_key,
-            webhook_url=webhook_url,
-            webhook_secret=webhook_secret,
-        )
-        return FakeTask(self.job_id)
+    def apply_async(self, *, kwargs, task_id):
+        self.calls.append((task_id, kwargs))
+        return FakeTask(task_id)
 
 
-class FakeAsyncResult:
-    def __init__(self, state="SUCCESS", result=None, info=None):
-        self.state = state
-        self.result = result
-        self.info = info
+@pytest.fixture
+def fake_runner(monkeypatch):
+    runner = FakeTaskRunner()
+    monkeypatch.setattr(routes.jobs, "run_harvester_task", runner)
+    return runner
 
 
-def _capture_delay(monkeypatch, captured, job_id=None):
-    job_id = job_id or str(uuid.uuid4())
-    monkeypatch.setattr(
-        routes.jobs,
-        "run_harvester_task",
-        FakeTaskRunner(captured, job_id),
+def _insert_job(job_id=None, **fields):
+    job = Job(
+        job_id=job_id or str(uuid.uuid4()),
+        model=fields.get("model", "gemini-2.5-flash"),
+        url=fields.get("url", "https://example.com"),
+        status=fields.get("status", "queued"),
+        result=fields.get("result"),
+        logs=fields.get("logs"),
+        error=fields.get("error"),
     )
-    return job_id
+    with SessionLocal() as db:
+        db.add(job)
+        db.commit()
+        return job.job_id
 
 
-def test_submit_with_webhook(monkeypatch):
-    captured = {}
-    job_id = _capture_delay(monkeypatch, captured)
-
+def test_submit_job_creates_row_and_enqueues(fake_runner):
     resp = client.post(
         "/jobs/",
         json={
             "model": "gemini-2.5-flash",
             "url": "https://example.com",
             "webhook_url": "https://receiver.example.com/hook",
-            "webhook_secret": "supersecretvalue123456",
         },
         headers=API_KEY_HEADER,
     )
 
     assert resp.status_code == 202
     body = resp.json()
-    assert body == {
-        "job_id": job_id,
-        "status": "queued",
-        "webhook_url": "https://receiver.example.com/hook",
-    }
-    assert captured["webhook_url"] == "https://receiver.example.com/hook"
-    assert captured["webhook_secret"] == "supersecretvalue123456"
+    assert body["status"] == "queued"
+    assert body["webhook_url"] == "https://receiver.example.com/hook"
+
+    assert len(fake_runner.calls) == 1
+    task_id, kwargs = fake_runner.calls[0]
+    assert task_id == body["job_id"]
+    assert kwargs["url"] == "https://example.com"
+    assert kwargs["model"] == "gemini-2.5-flash"
+    assert kwargs["api_key"] == "test-key"
+    assert kwargs["webhook_url"] == "https://receiver.example.com/hook"
+    assert kwargs["webhook_secret"] is None
+
+    with SessionLocal() as db:
+        row = db.get(Job, body["job_id"])
+        assert row is not None
+        assert row.status == "queued"
+        assert row.url == "https://example.com"
+        assert row.batch_id is None
 
 
-def test_submit_without_webhook(monkeypatch):
-    captured = {}
-    job_id = _capture_delay(monkeypatch, captured)
-
-    resp = client.post(
-        "/jobs/",
-        json={"model": "gemini-2.5-flash", "url": "https://example.com"},
-        headers=API_KEY_HEADER,
-    )
-
-    assert resp.status_code == 202
-    body = resp.json()
-    assert body["job_id"] == job_id
-    assert body["webhook_url"] is None
-    assert captured["webhook_url"] is None
-    assert captured["webhook_secret"] is None
-
-
-def test_submit_rejects_non_http_webhook_url(monkeypatch):
-    _capture_delay(monkeypatch, {})
-
+def test_submit_job_rejects_bad_webhook_url():
     resp = client.post(
         "/jobs/",
         json={
@@ -103,81 +92,64 @@ def test_submit_rejects_non_http_webhook_url(monkeypatch):
         },
         headers=API_KEY_HEADER,
     )
-
     assert resp.status_code == 422
 
 
-def test_submit_rejects_too_short_webhook_secret(monkeypatch):
-    _capture_delay(monkeypatch, {})
-
-    resp = client.post(
+def test_get_status_returns_queued(fake_runner):
+    job_id = client.post(
         "/jobs/",
-        json={
-            "model": "gemini-2.5-flash",
-            "url": "https://example.com",
-            "webhook_url": "https://receiver.example.com/hook",
-            "webhook_secret": "short",
-        },
+        json={"model": "gemini-2.5-flash", "url": "https://example.com"},
         headers=API_KEY_HEADER,
-    )
+    ).json()["job_id"]
 
-    assert resp.status_code == 422
-
-
-def test_get_status(monkeypatch):
-    monkeypatch.setattr(
-        routes.jobs,
-        "AsyncResult",
-        lambda job_id, app=None: FakeAsyncResult(state="PENDING"),
-    )
-
-    resp = client.get("/jobs/abc")
-
+    resp = client.get(f"/jobs/{job_id}")
     assert resp.status_code == 200
-    assert resp.json() == {"job_id": "abc", "status": "pending"}
+    assert resp.json() == {"job_id": job_id, "status": "queued"}
 
 
-def test_get_result_success(monkeypatch):
-    monkeypatch.setattr(
-        routes.jobs,
-        "AsyncResult",
-        lambda job_id, app=None: FakeAsyncResult(
-            state="SUCCESS",
-            result={"model": "gemini-2.5-flash", "result": {"title": "Example"}, "logs": "ok"},
-        ),
-    )
-
-    resp = client.get("/jobs/abc/result")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["job_id"] == "abc"
-    assert body["status"] == "success"
-    assert body["model"] == "gemini-2.5-flash"
-    assert body["result"] == {"title": "Example"}
-    assert body["logs"] == "ok"
+def test_get_status_unknown_returns_404():
+    resp = client.get("/jobs/does-not-exist")
+    assert resp.status_code == 404
 
 
-def test_get_result_pending(monkeypatch):
-    monkeypatch.setattr(
-        routes.jobs,
-        "AsyncResult",
-        lambda job_id, app=None: FakeAsyncResult(state="PENDING"),
-    )
+def test_get_result_pending_returns_202(fake_runner):
+    job_id = client.post(
+        "/jobs/",
+        json={"model": "gemini-2.5-flash", "url": "https://example.com"},
+        headers=API_KEY_HEADER,
+    ).json()["job_id"]
 
-    resp = client.get("/jobs/abc/result")
-
+    resp = client.get(f"/jobs/{job_id}/result")
     assert resp.status_code == 202
     assert resp.json()["detail"] == "Job still pending"
 
 
-def test_get_result_failure(monkeypatch):
-    monkeypatch.setattr(
-        routes.jobs,
-        "AsyncResult",
-        lambda job_id, app=None: FakeAsyncResult(state="FAILURE", info="boom"),
+def test_get_result_unknown_returns_404():
+    resp = client.get("/jobs/does-not-exist/result")
+    assert resp.status_code == 404
+
+
+def test_get_result_success():
+    job_id = _insert_job(
+        status="success",
+        result={"title": "Example"},
+        logs="done\n",
     )
 
-    resp = client.get("/jobs/abc/result")
+    resp = client.get(f"/jobs/{job_id}/result")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["job_id"] == job_id
+    assert body["status"] == "success"
+    assert body["result"] == {"title": "Example"}
+    assert body["logs"] == "done\n"
+
+
+def test_get_result_failure_returns_500():
+    job_id = _insert_job(status="failure", error="harvest_failed")
+
+    resp = client.get(f"/jobs/{job_id}/result")
 
     assert resp.status_code == 500
+    assert resp.json()["detail"] == "harvest_failed"
