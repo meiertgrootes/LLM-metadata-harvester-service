@@ -8,7 +8,7 @@ import json
 import os
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 app = FastAPI(title="Webhook receiver (dev)")
 
@@ -35,7 +35,7 @@ async def receive(request: Request):
 
     if not _verify_signature(body, signature):
         print("SIGNATURE VERIFICATION FAILED")
-        return {"status": "invalid_signature"}
+        raise HTTPException(status_code=401, detail="invalid_signature")
 
     payload = json.loads(body)
     print(json.dumps(payload, indent=2, ensure_ascii=False))

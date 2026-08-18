@@ -13,6 +13,7 @@ from llm_metadata_harvester_service.api.schemas import (
 )
 from llm_metadata_harvester_service.db.models import Job
 from llm_metadata_harvester_service.db.session import get_db
+from llm_metadata_harvester_service.db.status import JobStatus
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
@@ -44,10 +45,10 @@ def get_batch_status(
     counts = Counter(job.status for job in jobs)
 
     summary = BatchSummary(
-        queued=counts.get("queued", 0),
-        pending=counts.get("pending", 0),
-        success=counts.get("success", 0),
-        failed=counts.get("failure", 0),
+        queued=counts.get(JobStatus.QUEUED, 0),
+        pending=counts.get(JobStatus.PENDING, 0),
+        success=counts.get(JobStatus.SUCCESS, 0),
+        failed=counts.get(JobStatus.FAILURE, 0),
         total=len(jobs),
     )
     references = [

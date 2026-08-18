@@ -13,6 +13,7 @@ from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.workers.webhook import (
     _build_body,
     _deliver,
+    _parse_retry_after,
     _record_attempt,
     _record_delivered,
     _record_failed,
@@ -56,7 +57,7 @@ def test_dispatch_success_posts_signed_payload(monkeypatch):
     captured = {}
 
     class FakeClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             captured["timeout"] = timeout
 
         def __enter__(self):
@@ -81,7 +82,7 @@ def test_dispatch_success_posts_signed_payload(monkeypatch):
         event="job.completed",
     )
 
-    assert delivered is True
+    assert delivered.delivered is True
     assert captured["url"] == WEBHOOK_URL
     assert captured["timeout"] == 10.0
     assert captured["headers"]["X-Webhook-Signature"] == (
@@ -96,7 +97,7 @@ def test_dispatch_without_secret_sets_no_signature(monkeypatch):
     captured = {}
 
     class FakeClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             pass
 
         def __enter__(self):
@@ -119,13 +120,13 @@ def test_dispatch_without_secret_sets_no_signature(monkeypatch):
         event="job.completed",
     )
 
-    assert delivered is True
+    assert delivered.delivered is True
     assert "X-Webhook-Signature" not in captured["headers"]
 
 
 def test_dispatch_retries_on_connection_error(monkeypatch):
     class BoomClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             pass
 
         def __enter__(self):
@@ -150,11 +151,12 @@ def test_dispatch_retries_on_connection_error(monkeypatch):
         )
     self.retry.assert_called_once()
     assert "exc" in self.retry.call_args.kwargs
+    assert self.retry.call_args.kwargs["countdown"] == 2.0
 
 
 def test_dispatch_gives_up_after_final_connection_error(monkeypatch):
     class BoomClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             pass
 
         def __enter__(self):
@@ -176,7 +178,8 @@ def test_dispatch_gives_up_after_final_connection_error(monkeypatch):
         webhook_secret=SECRET,
         event="job.completed",
     )
-    assert delivered is False
+    assert delivered.delivered is False
+    assert delivered.error == "connection_error"
     self.retry.assert_not_called()
 
 
@@ -188,7 +191,7 @@ def test_dispatch_retries_on_non_2xx(monkeypatch):
     )
 
     class FiveClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             pass
 
         def __enter__(self):
@@ -212,7 +215,39 @@ def test_dispatch_retries_on_non_2xx(monkeypatch):
             event="job.completed",
         )
     self.retry.assert_called_once()
-    assert self.retry.call_args.kwargs.get("countdown") is None
+    assert self.retry.call_args.kwargs["countdown"] == 2.0
+
+
+def test_dispatch_retries_on_redirect(monkeypatch):
+    response = SimpleNamespace(
+        status_code=302,
+        headers={"Location": "https://elsewhere.example/hook"},
+        request=httpx.Request("POST", WEBHOOK_URL),
+    )
+
+    class RedirectClient:
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, content, headers):
+            return response
+
+    monkeypatch.setattr(httpx, "Client", RedirectClient)
+    self = _fake_self(retries=0, max_retries=4)
+    with pytest.raises(Retry):
+        _deliver(
+            self,
+            payload=PAYLOAD,
+            webhook_url=WEBHOOK_URL,
+            webhook_secret=SECRET,
+            event="job.completed",
+        )
 
 
 def test_dispatch_honours_retry_after(monkeypatch):
@@ -223,7 +258,7 @@ def test_dispatch_honours_retry_after(monkeypatch):
     )
 
     class RateClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             pass
 
         def __enter__(self):
@@ -249,6 +284,37 @@ def test_dispatch_honours_retry_after(monkeypatch):
     assert self.retry.call_args.kwargs["countdown"] == 5.0
 
 
+def test_retry_backoff_is_exponential(monkeypatch):
+    class BoomClient:
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, content, headers):
+            raise httpx.ConnectError("nope", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "Client", BoomClient)
+    self = _fake_self(retries=3, max_retries=4)
+    with pytest.raises(Retry):
+        _deliver(
+            self,
+            payload=PAYLOAD,
+            webhook_url=WEBHOOK_URL,
+            webhook_secret=SECRET,
+            event="job.completed",
+        )
+    assert self.retry.call_args.kwargs["countdown"] == 16.0
+
+
+def test_retry_after_is_clamped():
+    assert _parse_retry_after("9999", 2.0) == 300.0
+
+
 def test_dispatch_gives_up_after_final_non_2xx(monkeypatch):
     response = SimpleNamespace(
         status_code=500,
@@ -257,7 +323,7 @@ def test_dispatch_gives_up_after_final_non_2xx(monkeypatch):
     )
 
     class FiveClient:
-        def __init__(self, timeout):
+        def __init__(self, timeout, follow_redirects=False, **kwargs):
             pass
 
         def __enter__(self):
@@ -279,7 +345,8 @@ def test_dispatch_gives_up_after_final_non_2xx(monkeypatch):
         webhook_secret=SECRET,
         event="job.completed",
     )
-    assert delivered is False
+    assert delivered.delivered is False
+    assert delivered.error == "http_status:500"
     self.retry.assert_not_called()
 
 
@@ -315,10 +382,25 @@ def test_record_delivery_metadata():
 
     with SessionLocal() as db:
         job = db.get(Job, job_id)
-        assert job.webhook_error == "delivery failed permanently"
+        assert job.webhook_error is None
 
 
 def test_record_delivery_metadata_missing_job_is_noop():
     _record_attempt("nope")
     _record_delivered("nope")
     _record_failed("nope", "boom")
+
+
+def test_failed_duplicate_does_not_override_delivered_outcome():
+    job_id = "job-delivered"
+    with SessionLocal() as db:
+        db.add(Job(job_id=job_id, model="m", url="https://x.example", status="success"))
+        db.commit()
+
+    _record_delivered(job_id)
+    _record_failed(job_id, "http_status:500")
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.webhook_delivered_at is not None
+        assert job.webhook_error is None

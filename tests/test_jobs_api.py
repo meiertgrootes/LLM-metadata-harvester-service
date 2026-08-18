@@ -70,9 +70,9 @@ def test_submit_job_creates_row_and_enqueues(fake_runner):
     assert task_id == body["job_id"]
     assert kwargs["url"] == "https://example.com"
     assert kwargs["model"] == "gemini-2.5-flash"
-    assert kwargs["api_key"] == "test-key"
+    assert "test-key" not in kwargs["encrypted_api_key"]
     assert kwargs["webhook_url"] == "https://receiver.example.com/hook"
-    assert kwargs["webhook_secret"] is None
+    assert kwargs["encrypted_webhook_secret"] is None
 
     with SessionLocal() as db:
         row = db.get(Job, body["job_id"])
@@ -81,6 +81,22 @@ def test_submit_job_creates_row_and_enqueues(fake_runner):
         assert row.url == "https://example.com"
         assert row.batch_id is None
 
+
+def test_submit_encrypts_webhook_secret(fake_runner):
+    secret = "supersecretvalue123456"
+    response = client.post(
+        "/jobs/",
+        json={
+            "model": "gemini-2.5-flash",
+            "url": "https://example.com",
+            "webhook_url": "https://receiver.example.com/hook",
+            "webhook_secret": secret,
+        },
+        headers=API_KEY_HEADER,
+    )
+    assert response.status_code == 202
+    _, kwargs = fake_runner.calls[0]
+    assert secret not in kwargs["encrypted_webhook_secret"]
 
 def test_submit_job_rejects_bad_webhook_url():
     resp = client.post(
@@ -93,6 +109,35 @@ def test_submit_job_rejects_bad_webhook_url():
         headers=API_KEY_HEADER,
     )
     assert resp.status_code == 422
+
+
+def test_submit_job_rejects_overlong_model():
+    resp = client.post(
+        "/jobs/",
+        json={"model": "m" * 129, "url": "https://example.com"},
+        headers=API_KEY_HEADER,
+    )
+    assert resp.status_code == 422
+
+
+def test_submit_job_enqueue_failure_marks_dispatch_unconfirmed(monkeypatch):
+    class FailingTaskRunner:
+        def apply_async(self, *, kwargs, task_id):
+            raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(routes.jobs, "run_harvester_task", FailingTaskRunner())
+    resp = client.post(
+        "/jobs/",
+        json={"model": "gemini-2.5-flash", "url": "https://example.com"},
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "dispatch_unconfirmed"
+    with SessionLocal() as db:
+        row = db.query(Job).one()
+        assert row.status == "queued"
+        assert row.error == "dispatch_unconfirmed"
 
 
 def test_get_status_returns_queued(fake_runner):

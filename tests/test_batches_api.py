@@ -96,6 +96,55 @@ def test_submit_batch_rejects_over_limit():
     assert resp.status_code == 422
 
 
+def test_submit_batch_reports_partial_dispatch_failure(monkeypatch):
+    class PartiallyFailingTaskRunner:
+        calls = 0
+
+        def apply_async(self, *, kwargs, task_id):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("broker unavailable")
+            return type("Task", (), {"id": task_id})()
+
+    monkeypatch.setattr(
+        routes.jobs, "run_harvester_task", PartiallyFailingTaskRunner()
+    )
+    resp = client.post(
+        "/jobs/batch/",
+        json={
+            "model": "gemini-2.5-flash",
+            "urls": ["https://a.example", "https://b.example"],
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "dispatch_unconfirmed"
+    assert [job["status"] for job in resp.json()["jobs"]] == [
+        "queued",
+        "queued",
+    ]
+
+
+def test_submit_batch_reports_unconfirmed_dispatch(monkeypatch):
+    class FailingTaskRunner:
+        def apply_async(self, *, kwargs, task_id):
+            raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(routes.jobs, "run_harvester_task", FailingTaskRunner())
+    resp = client.post(
+        "/jobs/batch/",
+        json={
+            "model": "gemini-2.5-flash",
+            "urls": ["https://a.example", "https://b.example"],
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "dispatch_unconfirmed"
+
+
 def test_get_batch_status_summary():
     batch_id = str(uuid.uuid4())
     _insert_batch_jobs(

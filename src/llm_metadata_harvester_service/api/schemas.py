@@ -3,12 +3,18 @@ from typing import Any
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from llm_metadata_harvester_service.core.config import BATCH_MAX_URLS
+from llm_metadata_harvester_service.core.webhook_security import (
+    WebhookURLValidationError,
+    validate_webhook_url,
+)
 
 # Job submission
 #=================
 
 class JobSubmitRequest(BaseModel):
-    model: str = Field(..., examples=["gemini-2.5-flash"])
+    model: str = Field(
+        ..., min_length=1, max_length=128, examples=["gemini-2.5-flash"]
+    )
     url: str = Field(
         ...,
         examples=["https://example.com or doi:10.5281/zenodo.12345"],
@@ -24,6 +30,16 @@ class JobSubmitRequest(BaseModel):
         max_length=256,
         description="Optional secret used to HMAC-sign the webhook payload",
     )
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _validate_webhook_destination(cls, url: HttpUrl | None) -> HttpUrl | None:
+        if url is not None:
+            try:
+                validate_webhook_url(str(url))
+            except WebhookURLValidationError as exc:
+                raise ValueError(str(exc)) from exc
+        return url
 
 
 class JobSubmitResponse(BaseModel):
@@ -58,7 +74,9 @@ class JobResultResponse(BaseModel):
 # ================
 
 class BatchSubmitRequest(BaseModel):
-    model: str = Field(..., examples=["gemini-2.5-flash"])
+    model: str = Field(
+        ..., min_length=1, max_length=128, examples=["gemini-2.5-flash"]
+    )
     urls: list[str] = Field(
         ...,
         min_length=1,
@@ -75,6 +93,16 @@ class BatchSubmitRequest(BaseModel):
         max_length=256,
         description="Optional secret used to HMAC-sign the webhook payload",
     )
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _validate_webhook_destination(cls, url: HttpUrl | None) -> HttpUrl | None:
+        if url is not None:
+            try:
+                validate_webhook_url(str(url))
+            except WebhookURLValidationError as exc:
+                raise ValueError(str(exc)) from exc
+        return url
 
     @field_validator("urls")
     @classmethod
