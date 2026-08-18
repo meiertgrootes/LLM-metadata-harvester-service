@@ -13,7 +13,7 @@ from llm_metadata_harvester_service.api.schemas import (
     JobSubmitRequest,
     JobSubmitResponse,
 )
-from llm_metadata_harvester_service.core.secrets import encrypt_task_secret
+from llm_metadata_harvester_service.core.secrets import encrypt_webhook_secret
 from llm_metadata_harvester_service.db.models import Job
 from llm_metadata_harvester_service.db.session import get_db
 from llm_metadata_harvester_service.db.status import JobStatus
@@ -28,17 +28,13 @@ def _enqueue(
     job_id: str,
     url: str,
     model: str,
-    encrypted_api_key: str,
-    webhook_url: str | None,
-    encrypted_webhook_secret: str | None,
+    api_key: str,
 ) -> None:
     run_harvester_task.apply_async(
         kwargs={
             "model": model,
             "url": url,
-            "encrypted_api_key": encrypted_api_key,
-            "webhook_url": webhook_url,
-            "encrypted_webhook_secret": encrypted_webhook_secret,
+            "api_key": api_key,
         },
         task_id=job_id,
     )
@@ -59,9 +55,8 @@ def submit_batch(
     """
     batch_id = str(uuid.uuid4())
     webhook_url = str(payload.webhook_url) if payload.webhook_url else None
-    encrypted_api_key = encrypt_task_secret(x_api_key)
     encrypted_webhook_secret = (
-        encrypt_task_secret(payload.webhook_secret)
+        encrypt_webhook_secret(payload.webhook_secret)
         if payload.webhook_secret is not None
         else None
     )
@@ -75,6 +70,7 @@ def submit_batch(
             url=url,
             status=JobStatus.QUEUED,
             webhook_url=webhook_url,
+            webhook_secret_encrypted=encrypted_webhook_secret,
         )
         db.add(job)
         jobs.append(job)
@@ -88,9 +84,7 @@ def submit_batch(
                 job_id=job.job_id,
                 url=job.url,
                 model=payload.model,
-                encrypted_api_key=encrypted_api_key,
-                webhook_url=webhook_url,
-                encrypted_webhook_secret=encrypted_webhook_secret,
+                api_key=x_api_key,
             )
         except Exception:
             logger.exception("failed to enqueue batch job %s", job.job_id)
@@ -126,9 +120,8 @@ def submit_job(
     """
     job_id = str(uuid.uuid4())
     webhook_url = str(payload.webhook_url) if payload.webhook_url else None
-    encrypted_api_key = encrypt_task_secret(x_api_key)
     encrypted_webhook_secret = (
-        encrypt_task_secret(payload.webhook_secret)
+        encrypt_webhook_secret(payload.webhook_secret)
         if payload.webhook_secret is not None
         else None
     )
@@ -139,6 +132,7 @@ def submit_job(
         url=payload.url,
         status=JobStatus.QUEUED,
         webhook_url=webhook_url,
+        webhook_secret_encrypted=encrypted_webhook_secret,
     )
     db.add(job)
     db.commit()
@@ -148,9 +142,7 @@ def submit_job(
             job_id=job_id,
             url=payload.url,
             model=payload.model,
-            encrypted_api_key=encrypted_api_key,
-            webhook_url=webhook_url,
-            encrypted_webhook_secret=encrypted_webhook_secret,
+            api_key=x_api_key,
         )
     except Exception:
         logger.exception("failed to enqueue job %s", job_id)

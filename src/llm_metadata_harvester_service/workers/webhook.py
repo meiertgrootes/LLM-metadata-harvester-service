@@ -1,35 +1,32 @@
-# src/llm_metadata_harvester_service/workers/webhook.py
-
 import hashlib
 import hmac
 import json
 import logging
 import ssl
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlparse
 
 import httpcore
 import httpx
-from celery.exceptions import Retry
-from sqlalchemy import case, update
+from sqlalchemy import or_, select, update
 
 from llm_metadata_harvester_service.core.celery_app import celery_app
 from llm_metadata_harvester_service.core.config import (
     WEBHOOK_MAX_ATTEMPTS,
+    WEBHOOK_OUTBOX_LEASE_SECONDS,
     WEBHOOK_RETRY_AFTER_MAX_SECONDS,
     WEBHOOK_RETRY_BACKOFF,
     WEBHOOK_TIMEOUT_SECONDS,
 )
-from llm_metadata_harvester_service.core.secrets import decrypt_task_secret
+from llm_metadata_harvester_service.core.secrets import decrypt_webhook_secret
 from llm_metadata_harvester_service.core.webhook_security import validate_webhook_url
-from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.db.models import Job, WebhookOutbox
 from llm_metadata_harvester_service.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
-
 _WEBHOOK_MAX_BACKOFF_SECONDS = 32
 
 
@@ -37,6 +34,7 @@ _WEBHOOK_MAX_BACKOFF_SECONDS = 32
 class DeliveryOutcome:
     delivered: bool
     error: str | None = None
+    retry_after: float | None = None
 
 
 class _PinnedNetworkBackend(httpcore.SyncBackend):
@@ -79,7 +77,6 @@ class _PinnedHTTPTransport(httpx.HTTPTransport):
 
 
 def sign_payload(body: bytes, secret: str) -> str:
-    """Return the HMAC-SHA256 signature of the raw webhook body."""
     return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
@@ -92,186 +89,7 @@ def _build_body(event: str, payload: dict[str, Any]) -> bytes:
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
-def _record_attempt(job_id: str) -> None:
-    with SessionLocal.begin() as db:
-        db.execute(
-            update(Job)
-            .where(Job.job_id == job_id)
-            .values(
-                webhook_attempts=Job.webhook_attempts + 1,
-                webhook_last_attempt_at=datetime.now(UTC),
-            )
-        )
-
-
-def _record_delivered(job_id: str) -> None:
-    with SessionLocal.begin() as db:
-        db.execute(
-            update(Job)
-            .where(Job.job_id == job_id)
-            .values(webhook_delivered_at=datetime.now(UTC), webhook_error=None)
-        )
-
-
-def _record_failed(job_id: str, error: str) -> None:
-    with SessionLocal.begin() as db:
-        db.execute(
-            update(Job)
-            .where(Job.job_id == job_id)
-            .values(
-                webhook_error=case(
-                    (Job.webhook_delivered_at.is_(None), error),
-                    else_=Job.webhook_error,
-                )
-            )
-        )
-
-
-@celery_app.task(
-    bind=True,
-    max_retries=WEBHOOK_MAX_ATTEMPTS - 1,
-    default_retry_delay=WEBHOOK_RETRY_BACKOFF,
-)
-def dispatch_webhook(
-    self: Any,
-    *,
-    payload: dict[str, Any],
-    webhook_url: str,
-    encrypted_webhook_secret: str | None,
-    event: str,
-) -> None:
-    """
-    Deliver a job payload to a client-supplied webhook endpoint.
-
-    The body is HMAC-SHA256 signed when a ``webhook_secret`` was provided at
-    submission time. Delivery is retried with exponential backoff on transient
-    HTTP errors and non-2xx responses, honouring ``Retry-After`` when present.
-    Delivery metadata is recorded on the job row (best-effort; database
-    failures never block delivery).
-    """
-    job_id = payload["job_id"]
-    webhook_secret = (
-        decrypt_task_secret(encrypted_webhook_secret)
-        if encrypted_webhook_secret is not None
-        else None
-    )
-
-    try:
-        _record_attempt(job_id)
-    except Exception:
-        logger.warning("could not record webhook attempt for %s", job_id, exc_info=True)
-
-    try:
-        outcome = _deliver(
-            self,
-            payload=payload,
-            webhook_url=webhook_url,
-            webhook_secret=webhook_secret,
-            event=event,
-        )
-    except Retry:
-        raise
-    except Exception as exc:
-        try:
-            _record_failed(job_id, str(exc))
-        except Exception:
-            logger.warning("could not record webhook failure for %s", job_id, exc_info=True)
-        raise
-
-    try:
-        if outcome.delivered:
-            _record_delivered(job_id)
-        else:
-            _record_failed(job_id, outcome.error or "delivery_failed")
-    except Exception:
-        logger.warning("could not record webhook outcome for %s", job_id, exc_info=True)
-
-
-def _deliver(
-    self: Any,
-    *,
-    payload: dict[str, Any],
-    webhook_url: str,
-    webhook_secret: str | None,
-    event: str,
-) -> DeliveryOutcome:
-    """Attempt delivery and return the final outcome or schedule a retry."""
-    scheme = urlparse(webhook_url).scheme
-    if scheme not in ("http", "https"):
-        raise ValueError(f"Unsupported webhook URL scheme: {scheme!r}")
-    addresses = validate_webhook_url(webhook_url)
-
-    body = _build_body(event, payload)
-
-    headers = {"Content-Type": "application/json"}
-    if webhook_secret:
-        headers["X-Webhook-Signature"] = f"sha256={sign_payload(body, webhook_secret)}"
-
-    is_final_attempt = self.request.retries >= self.max_retries
-    countdown = min(
-        WEBHOOK_RETRY_BACKOFF * (2**self.request.retries),
-        _WEBHOOK_MAX_BACKOFF_SECONDS,
-    )
-
-    try:
-        transport = (
-            _PinnedHTTPTransport(urlparse(webhook_url).hostname or "", addresses)
-            if addresses is not None
-            else None
-        )
-        with httpx.Client(
-            timeout=WEBHOOK_TIMEOUT_SECONDS,
-            follow_redirects=False,
-            trust_env=False,
-            transport=transport,
-        ) as client:
-            response = client.post(webhook_url, content=body, headers=headers)
-    except httpx.HTTPError as exc:
-        if is_final_attempt:
-            logger.error(
-                "webhook delivery failed permanently for %s (event=%s): %s",
-                webhook_url,
-                event,
-                exc,
-            )
-            return DeliveryOutcome(False, "connection_error")
-        raise self.retry(exc=exc, countdown=countdown) from exc
-
-    if not 200 <= response.status_code < 300:
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            countdown = _parse_retry_after(retry_after, countdown)
-
-        if is_final_attempt:
-            logger.error(
-                "webhook delivery failed permanently for %s (event=%s): HTTP %s",
-                webhook_url,
-                event,
-                response.status_code,
-            )
-            return DeliveryOutcome(False, f"http_status:{response.status_code}")
-
-        logger.warning(
-            "webhook delivery failed (attempt %s/%s) for %s: HTTP %s",
-            self.request.retries + 1,
-            WEBHOOK_MAX_ATTEMPTS,
-            webhook_url,
-            response.status_code,
-        )
-        raise self.retry(
-            exc=httpx.HTTPStatusError(
-                f"Webhook endpoint returned HTTP {response.status_code}",
-                request=response.request,
-                response=response,
-            ),
-            countdown=countdown,
-        )
-
-    logger.info("webhook delivered to %s (event=%s)", webhook_url, event)
-    return DeliveryOutcome(True)
-
-
-def _parse_retry_after(value: str, fallback: float) -> float:
+def _parse_retry_after(value: str) -> float | None:
     try:
         seconds = float(value)
     except ValueError:
@@ -281,5 +99,208 @@ def _parse_retry_after(value: str, fallback: float) -> float:
                 retry_at = retry_at.replace(tzinfo=UTC)
             seconds = (retry_at - datetime.now(UTC)).total_seconds()
         except (TypeError, ValueError, OverflowError):
-            return fallback
+            return None
     return min(max(seconds, 0), WEBHOOK_RETRY_AFTER_MAX_SECONDS)
+
+
+def _deliver_once(
+    *,
+    payload: dict[str, Any],
+    webhook_url: str,
+    webhook_secret: str | None,
+    event: str,
+) -> DeliveryOutcome:
+    addresses = validate_webhook_url(webhook_url)
+    body = _build_body(event, payload)
+    headers = {"Content-Type": "application/json"}
+    if webhook_secret:
+        headers["X-Webhook-Signature"] = f"sha256={sign_payload(body, webhook_secret)}"
+
+    transport = (
+        _PinnedHTTPTransport(urlparse(webhook_url).hostname or "", addresses)
+        if addresses is not None
+        else None
+    )
+    try:
+        with httpx.Client(
+            timeout=WEBHOOK_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            trust_env=False,
+            transport=transport,
+        ) as client:
+            response = client.post(webhook_url, content=body, headers=headers)
+    except httpx.HTTPError:
+        return DeliveryOutcome(False, "connection_error")
+
+    if not 200 <= response.status_code < 300:
+        retry_after = response.headers.get("Retry-After")
+        return DeliveryOutcome(
+            False,
+            f"http_status:{response.status_code}",
+            _parse_retry_after(retry_after) if retry_after else None,
+        )
+    return DeliveryOutcome(True)
+
+
+def _job_payload(job: Job) -> dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "model": job.model,
+        "result": job.result,
+        "logs": job.logs or "",
+        "error": job.error,
+    }
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+@celery_app.task
+def publish_pending_webhooks(limit: int = 100) -> int:
+    now = datetime.now(UTC)
+    lease_cutoff = now - timedelta(seconds=WEBHOOK_OUTBOX_LEASE_SECONDS)
+    with SessionLocal.begin() as db:
+        rows = list(
+            db.scalars(
+                select(WebhookOutbox)
+                .where(
+                    WebhookOutbox.delivered_at.is_(None),
+                    WebhookOutbox.exhausted_at.is_(None),
+                    WebhookOutbox.next_attempt_at <= now,
+                    or_(
+                        WebhookOutbox.published_at.is_(None),
+                        WebhookOutbox.published_at < lease_cutoff,
+                    ),
+                    or_(
+                        WebhookOutbox.delivery_started_at.is_(None),
+                        WebhookOutbox.delivery_started_at < lease_cutoff,
+                    ),
+                )
+                .order_by(WebhookOutbox.next_attempt_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        for row in rows:
+            row.published_at = now
+        dispatches = [(row.job_id, row.attempts + 1) for row in rows]
+
+    published = 0
+    for job_id, attempt in dispatches:
+        try:
+            deliver_job_webhook.apply_async(
+                kwargs={"job_id": job_id},
+                task_id=f"webhook:{job_id}:{attempt}",
+            )
+            published += 1
+        except Exception:
+            logger.exception("failed to publish webhook outbox job %s", job_id)
+            with SessionLocal.begin() as db:
+                db.execute(
+                    update(WebhookOutbox)
+                    .where(
+                        WebhookOutbox.job_id == job_id,
+                        WebhookOutbox.published_at == now,
+                    )
+                    .values(published_at=None, last_error="publish_failed")
+                )
+    return published
+
+
+@celery_app.task
+def deliver_job_webhook(*, job_id: str) -> str:
+    started_at = datetime.now(UTC)
+    lease_cutoff = started_at - timedelta(seconds=WEBHOOK_OUTBOX_LEASE_SECONDS)
+    with SessionLocal.begin() as db:
+        outbox = db.scalar(
+            select(WebhookOutbox)
+            .where(WebhookOutbox.job_id == job_id)
+            .with_for_update()
+        )
+        if outbox is None:
+            return "missing"
+        if outbox.delivered_at is not None:
+            return "delivered"
+        if outbox.exhausted_at is not None:
+            return "exhausted"
+        if _utc(outbox.next_attempt_at) > started_at:
+            return "not_due"
+        if (
+            outbox.delivery_started_at is not None
+            and _utc(outbox.delivery_started_at) >= lease_cutoff
+        ):
+            return "in_progress"
+
+        job = db.get(Job, job_id)
+        if job is None or job.webhook_url is None:
+            outbox.exhausted_at = started_at
+            outbox.last_error = "job_or_webhook_missing"
+            outbox.encrypted_secret = None
+            return "exhausted"
+
+        outbox.attempts += 1
+        attempt = outbox.attempts
+        outbox.delivery_started_at = started_at
+        job.webhook_attempts = attempt
+        job.webhook_last_attempt_at = started_at
+        payload = _job_payload(job)
+        webhook_url = job.webhook_url
+        event = outbox.event
+        encrypted_secret = outbox.encrypted_secret
+
+    try:
+        secret = (
+            decrypt_webhook_secret(encrypted_secret)
+            if encrypted_secret is not None
+            else None
+        )
+        outcome = _deliver_once(
+            payload=payload,
+            webhook_url=webhook_url,
+            webhook_secret=secret,
+            event=event,
+        )
+    except Exception as exc:
+        outcome = DeliveryOutcome(False, f"delivery_error:{type(exc).__name__}")
+
+    finished_at = datetime.now(UTC)
+    with SessionLocal.begin() as db:
+        outbox = db.scalar(
+            select(WebhookOutbox)
+            .where(WebhookOutbox.job_id == job_id)
+            .with_for_update()
+        )
+        if outbox is None:
+            return "missing"
+        if outbox.attempts != attempt:
+            return "superseded"
+        job = db.get(Job, job_id)
+        if outcome.delivered:
+            outbox.delivered_at = finished_at
+            outbox.encrypted_secret = None
+            outbox.last_error = None
+            if job is not None:
+                job.webhook_delivered_at = finished_at
+                job.webhook_error = None
+            return "delivered"
+
+        outbox.last_error = outcome.error or "delivery_failed"
+        if job is not None:
+            job.webhook_error = outbox.last_error
+        if attempt >= WEBHOOK_MAX_ATTEMPTS:
+            outbox.exhausted_at = finished_at
+            outbox.encrypted_secret = None
+            return "exhausted"
+
+        delay = outcome.retry_after
+        if delay is None:
+            delay = min(
+                WEBHOOK_RETRY_BACKOFF * (2 ** (attempt - 1)),
+                _WEBHOOK_MAX_BACKOFF_SECONDS,
+            )
+        outbox.next_attempt_at = finished_at + timedelta(seconds=delay)
+        outbox.published_at = None
+        outbox.delivery_started_at = None
+        return "retry_scheduled"

@@ -10,7 +10,7 @@ _TMPDIR = tempfile.mkdtemp(prefix="llm-harvester-tests-")
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDIR}/test.db"
 os.environ["CELERY_BROKER_URL"] = "memory://"
 os.environ["WEBHOOK_ALLOWED_HOSTS"] = "receiver.example.com"
-os.environ["TASK_SECRET_KEY"] = "o1pxvABKy2_-zKRx2m60YhBvsRqGXTNgSbh7wAwmOPY="
+os.environ["WEBHOOK_SECRET_KEY"] = "o1pxvABKy2_-zKRx2m60YhBvsRqGXTNgSbh7wAwmOPY="
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 ROOT = SRC.parent

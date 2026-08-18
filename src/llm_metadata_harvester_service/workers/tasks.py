@@ -10,20 +10,18 @@ from typing import Any
 
 from billiard.exceptions import SoftTimeLimitExceeded
 from llm_metadata_harvester.harvester_operations import metadata_harvest
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.orm import Session
 
 from llm_metadata_harvester_service.core.celery_app import celery_app
 from llm_metadata_harvester_service.core.config import (
-    JOB_MAX_EXECUTION_ATTEMPTS,
     JOB_PENDING_STALE_SECONDS,
     JOB_QUEUED_STALE_SECONDS,
 )
-from llm_metadata_harvester_service.core.secrets import decrypt_task_secret
-from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.db.models import Job, WebhookOutbox
 from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.db.status import TERMINAL_JOB_STATUSES, JobStatus
-from llm_metadata_harvester_service.workers.webhook import dispatch_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +37,25 @@ def _payload_from_job(job: Job) -> dict[str, Any]:
     }
 
 
-def _claim_job(
-    job_id: str, *, allow_pending_reclaim: bool
-) -> tuple[int | None, dict[str, Any], bool]:
+def _ensure_webhook_outbox(
+    db: Session, job: Job, *, event: str, now: datetime
+) -> None:
+    if job.webhook_url is None:
+        job.webhook_secret_encrypted = None
+        return
+    if db.get(WebhookOutbox, job.job_id) is None:
+        db.add(
+            WebhookOutbox(
+                job_id=job.job_id,
+                event=event,
+                encrypted_secret=job.webhook_secret_encrypted,
+                next_attempt_at=now,
+            )
+        )
+    job.webhook_secret_encrypted = None
+
+
+def _claim_job(job_id: str) -> tuple[int | None, dict[str, Any]]:
     with SessionLocal.begin() as db:
         job = db.scalar(select(Job).where(Job.job_id == job_id).with_for_update())
         if job is None:
@@ -53,22 +67,15 @@ def _claim_job(
                 "result": None,
                 "logs": "",
                 "error": "job_not_found",
-            }, False
-        if job.status in TERMINAL_JOB_STATUSES:
-            return None, _payload_from_job(job), False
-        if job.status == JobStatus.PENDING and not allow_pending_reclaim:
-            return None, _payload_from_job(job), False
-        if job.execution_attempts >= JOB_MAX_EXECUTION_ATTEMPTS:
-            job.status = JobStatus.FAILURE
-            job.error = "execution_attempts_exhausted"
-            job.completed_at = datetime.now(UTC)
-            return None, _payload_from_job(job), True
+            }
+        if job.status in TERMINAL_JOB_STATUSES or job.status == JobStatus.PENDING:
+            return None, _payload_from_job(job)
 
         job.execution_attempts += 1
         job.status = JobStatus.PENDING
         job.error = None
         job.completed_at = None
-        return job.execution_attempts, _payload_from_job(job), False
+        return job.execution_attempts, _payload_from_job(job)
 
 
 def _complete_job(
@@ -99,46 +106,14 @@ def _complete_job(
             )
         )
         assert isinstance(outcome, CursorResult)
-        return outcome.rowcount == 1
-
-
-def _record_webhook_enqueue_failure(job_id: str) -> None:
-    with SessionLocal.begin() as db:
-        db.execute(
-            update(Job)
-            .where(Job.job_id == job_id)
-            .values(webhook_error="dispatch_failed", updated_at=datetime.now(UTC))
-        )
-
-
-def _enqueue_webhook(
-    *,
-    payload: dict[str, Any],
-    webhook_url: str | None,
-    encrypted_webhook_secret: str | None,
-    event: str,
-) -> None:
-    if webhook_url is None:
-        return
-    try:
-        dispatch_webhook.apply_async(
-            kwargs={
-                "payload": payload,
-                "webhook_url": webhook_url,
-                "encrypted_webhook_secret": encrypted_webhook_secret,
-                "event": event,
-            },
-            task_id=f"webhook:{payload['job_id']}:{event}",
-        )
-    except Exception:
-        logger.exception("failed to enqueue webhook for job %s", payload["job_id"])
-        try:
-            _record_webhook_enqueue_failure(payload["job_id"])
-        except Exception:
-            logger.exception(
-                "failed to record webhook enqueue failure for job %s",
-                payload["job_id"],
-            )
+        if outcome.rowcount != 1:
+            return False
+        job = db.get(Job, job_id)
+        if job is None:
+            raise RuntimeError(f"Job disappeared while completing: {job_id}")
+        event = "job.completed" if status == JobStatus.SUCCESS else "job.failed"
+        _ensure_webhook_outbox(db, job, event=event, now=now)
+        return True
 
 
 def _current_payload(job_id: str) -> dict[str, Any]:
@@ -154,25 +129,11 @@ def _run_harvest(
     *,
     model: str,
     url: str,
-    encrypted_api_key: str,
-    webhook_url: str | None = None,
-    encrypted_webhook_secret: str | None = None,
-    allow_pending_reclaim: bool = False,
+    api_key: str,
 ) -> dict[str, Any]:
-    attempt, existing_payload, notify = _claim_job(
-        job_id, allow_pending_reclaim=allow_pending_reclaim
-    )
+    attempt, existing_payload = _claim_job(job_id)
     if attempt is None:
-        if notify:
-            _enqueue_webhook(
-                payload=existing_payload,
-                webhook_url=webhook_url,
-                encrypted_webhook_secret=encrypted_webhook_secret,
-                event="job.failed",
-            )
         return existing_payload
-
-    api_key = decrypt_task_secret(encrypted_api_key)
 
     stdout_buffer = io.StringIO()
     result: dict[str, Any]
@@ -182,34 +143,17 @@ def _run_harvest(
                 metadata_harvest(model_name=model, url=url, api_key=api_key)
             )
     except SoftTimeLimitExceeded:
-        error_code = "harvest_time_limit_exceeded"
         error_logs = stdout_buffer.getvalue() + "\n" + traceback.format_exc()
-        won = _complete_job(
+        _complete_job(
             job_id,
             attempt,
             status=JobStatus.FAILURE,
             result=None,
             logs=error_logs,
-            error=error_code,
+            error="harvest_time_limit_exceeded",
         )
-        if won:
-            payload: dict[str, Any] = {
-                "job_id": job_id,
-                "status": JobStatus.FAILURE,
-                "model": model,
-                "result": None,
-                "logs": error_logs,
-                "error": error_code,
-            }
-            _enqueue_webhook(
-                payload=payload,
-                webhook_url=webhook_url,
-                encrypted_webhook_secret=encrypted_webhook_secret,
-                event="job.failed",
-            )
         raise
     except Exception:
-        error_code = "harvest_failed"
         error_logs = stdout_buffer.getvalue() + "\n" + traceback.format_exc()
         won = _complete_job(
             job_id,
@@ -217,26 +161,13 @@ def _run_harvest(
             status=JobStatus.FAILURE,
             result=None,
             logs=error_logs,
-            error=error_code,
+            error="harvest_failed",
         )
         if not won:
             return _current_payload(job_id)
-        payload = {
-            "job_id": job_id,
-            "status": JobStatus.FAILURE,
-            "model": model,
-            "result": None,
-            "logs": error_logs,
-            "error": error_code,
-        }
+        payload = _current_payload(job_id)
         sys.stderr.write(json.dumps(payload) + "\n")
         sys.stderr.flush()
-        _enqueue_webhook(
-            payload=payload,
-            webhook_url=webhook_url,
-            encrypted_webhook_secret=encrypted_webhook_secret,
-            event="job.failed",
-        )
         raise
 
     logs = stdout_buffer.getvalue()
@@ -251,22 +182,9 @@ def _run_harvest(
     if not won:
         return _current_payload(job_id)
 
-    payload = {
-        "job_id": job_id,
-        "status": JobStatus.SUCCESS,
-        "model": model,
-        "result": result,
-        "logs": logs,
-        "error": None,
-    }
+    payload = _current_payload(job_id)
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
-    _enqueue_webhook(
-        payload=payload,
-        webhook_url=webhook_url,
-        encrypted_webhook_secret=encrypted_webhook_secret,
-        event="job.completed",
-    )
     return payload
 
 
@@ -276,20 +194,13 @@ def run_harvester_task(
     *,
     model: str,
     url: str,
-    encrypted_api_key: str,
-    webhook_url: str | None = None,
-    encrypted_webhook_secret: str | None = None,
+    api_key: str,
 ) -> dict[str, Any]:
     return _run_harvest(
         self.request.id,
         model=model,
         url=url,
-        encrypted_api_key=encrypted_api_key,
-        webhook_url=webhook_url,
-        encrypted_webhook_secret=encrypted_webhook_secret,
-        allow_pending_reclaim=bool(
-            (self.request.delivery_info or {}).get("redelivered", False)
-        ),
+        api_key=api_key,
     )
 
 
@@ -299,28 +210,28 @@ def reconcile_stale_jobs() -> int:
     pending_cutoff = now - timedelta(seconds=JOB_PENDING_STALE_SECONDS)
     queued_cutoff = now - timedelta(seconds=JOB_QUEUED_STALE_SECONDS)
     with SessionLocal.begin() as db:
-        pending_result = db.execute(
-            update(Job)
-            .where(Job.status == JobStatus.PENDING, Job.updated_at < pending_cutoff)
-            .values(
-                status=JobStatus.FAILURE,
-                error="worker_lost",
-                completed_at=now,
-                updated_at=now,
+        jobs = list(
+            db.scalars(
+                select(Job)
+                .where(
+                    or_(
+                        (Job.status == JobStatus.PENDING)
+                        & (Job.updated_at < pending_cutoff),
+                        (Job.status == JobStatus.QUEUED)
+                        & (Job.updated_at < queued_cutoff),
+                    )
+                )
+                .with_for_update(skip_locked=True)
             )
         )
-        queued_result = db.execute(
-            update(Job)
-            .where(Job.status == JobStatus.QUEUED, Job.updated_at < queued_cutoff)
-            .values(
-                status=JobStatus.FAILURE,
-                error="dispatch_lost",
-                completed_at=now,
-                updated_at=now,
+        for job in jobs:
+            job.error = (
+                "worker_lost"
+                if job.status == JobStatus.PENDING
+                else "dispatch_lost"
             )
-        )
-        assert isinstance(pending_result, CursorResult)
-        assert isinstance(queued_result, CursorResult)
-        pending = pending_result.rowcount
-        queued = queued_result.rowcount
-    return int(pending + queued)
+            job.status = JobStatus.FAILURE
+            job.completed_at = now
+            job.updated_at = now
+            _ensure_webhook_outbox(db, job, event="job.failed", now=now)
+    return len(jobs)

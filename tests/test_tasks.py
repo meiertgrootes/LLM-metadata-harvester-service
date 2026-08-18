@@ -1,299 +1,192 @@
 import uuid
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 
-from llm_metadata_harvester_service.core.secrets import encrypt_task_secret
-from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.core.secrets import encrypt_webhook_secret
+from llm_metadata_harvester_service.db.models import Job, WebhookOutbox
 from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.workers import tasks
 
 
-def test_active_redelivery_does_not_start_second_harvest(monkeypatch):
-    job_id = str(uuid.uuid4())
-    _add_job(job_id)
-    with SessionLocal() as db:
-        row = db.get(Job, job_id)
-        row.status = "pending"
-        row.execution_attempts = 1
-        db.commit()
-
-    async def unexpected_harvest(**kwargs):
-        raise AssertionError("active job was harvested again")
-
-    monkeypatch.setattr(tasks, "metadata_harvest", unexpected_harvest)
-    payload = tasks._run_harvest(
-        job_id,
-        model="gemini-2.5-flash",
-        url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
-    )
-
-    assert payload["status"] == "pending"
-    assert _get_job(job_id).execution_attempts == 1
-
-
-def test_broker_redelivery_reclaims_pending_job(monkeypatch):
-    job_id = str(uuid.uuid4())
-    _add_job(job_id)
-    with SessionLocal() as db:
-        row = db.get(Job, job_id)
-        row.status = "pending"
-        row.execution_attempts = 1
-        db.commit()
-
-    async def fake_harvest(*, model_name, url, api_key):
-        return {"title": "Recovered"}
-
-    monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    payload = tasks._run_harvest(
-        job_id,
-        model="gemini-2.5-flash",
-        url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
-        allow_pending_reclaim=True,
-    )
-
-    assert payload["status"] == "success"
-    assert _get_job(job_id).execution_attempts == 2
-
-
-def _add_job(job_id: str):
+def _add_job(
+    job_id: str,
+    *,
+    status: str = "queued",
+    webhook: bool = False,
+    updated_at: datetime | None = None,
+) -> None:
     with SessionLocal() as db:
         db.add(
             Job(
                 job_id=job_id,
                 model="gemini-2.5-flash",
                 url="https://example.com",
-                status="queued",
+                status=status,
+                webhook_url=(
+                    "https://receiver.example.com/hook" if webhook else None
+                ),
+                webhook_secret_encrypted=(
+                    encrypt_webhook_secret("supersecretvalue123456")
+                    if webhook
+                    else None
+                ),
+                updated_at=updated_at or datetime.now(UTC),
             )
         )
         db.commit()
 
 
-def _get_job(job_id: str):
+def _get_job(job_id: str) -> Job:
     with SessionLocal() as db:
-        return db.get(Job, job_id)
+        job = db.get(Job, job_id)
+        assert job is not None
+        db.expunge(job)
+        return job
 
 
-def _noop_dispatch(monkeypatch, calls=None):
-    if calls is None:
-        calls = []
-
-    def fake_apply_async(*, kwargs, task_id):
-        calls.append(kwargs)
-
-    monkeypatch.setattr(
-        tasks, "dispatch_webhook", SimpleNamespace(apply_async=fake_apply_async)
-    )
-    return calls
+def _get_outbox(job_id: str) -> WebhookOutbox | None:
+    with SessionLocal() as db:
+        row = db.get(WebhookOutbox, job_id)
+        if row is not None:
+            db.expunge(row)
+        return row
 
 
-def test_run_harvest_success_writes_result(monkeypatch):
+def test_run_harvest_success_writes_result_and_uses_plain_api_key(monkeypatch):
     job_id = str(uuid.uuid4())
     _add_job(job_id)
+    captured = {}
 
     async def fake_harvest(*, model_name, url, api_key):
-        return {"title": "Example", "status": "ok"}
+        captured["api_key"] = api_key
+        return {"title": "Example"}
 
     monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    _noop_dispatch(monkeypatch)
-
     payload = tasks._run_harvest(
         job_id,
         model="gemini-2.5-flash",
         url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
+        api_key="ephemeral-key",
     )
 
-    assert payload["job_id"] == job_id
     assert payload["status"] == "success"
-
-    row = _get_job(job_id)
-    assert row.status == "success"
-    assert row.result == {"title": "Example", "status": "ok"}
-    assert row.completed_at is not None
+    assert captured["api_key"] == "ephemeral-key"
+    assert _get_job(job_id).result == {"title": "Example"}
+    assert _get_outbox(job_id) is None
 
 
-def test_run_harvest_failure_writes_error(monkeypatch):
+def test_success_creates_transactional_webhook_outbox(monkeypatch):
     job_id = str(uuid.uuid4())
-    _add_job(job_id)
+    _add_job(job_id, webhook=True)
 
-    async def fake_harvest(*, model_name, url, api_key):
+    async def fake_harvest(**kwargs):
+        return {"title": "Example"}
+
+    monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
+    tasks._run_harvest(
+        job_id,
+        model="gemini-2.5-flash",
+        url="https://example.com",
+        api_key="k",
+    )
+
+    job = _get_job(job_id)
+    outbox = _get_outbox(job_id)
+    assert job.status == "success"
+    assert job.webhook_secret_encrypted is None
+    assert outbox is not None
+    assert outbox.event == "job.completed"
+    assert "supersecretvalue123456" not in (outbox.encrypted_secret or "")
+
+
+def test_failure_creates_transactional_webhook_outbox(monkeypatch):
+    job_id = str(uuid.uuid4())
+    _add_job(job_id, webhook=True)
+
+    async def fake_harvest(**kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    _noop_dispatch(monkeypatch)
-
     with pytest.raises(RuntimeError):
         tasks._run_harvest(
             job_id,
             model="gemini-2.5-flash",
             url="https://example.com",
-            encrypted_api_key=encrypt_task_secret("k"),
+            api_key="k",
         )
 
-    row = _get_job(job_id)
-    assert row.status == "failure"
-    assert row.error == "harvest_failed"
-    assert "RuntimeError: boom" in (row.logs or "")
-    assert row.completed_at is not None
+    assert _get_job(job_id).error == "harvest_failed"
+    assert _get_outbox(job_id).event == "job.failed"
 
 
-def test_run_harvest_dispatches_webhook_on_success(monkeypatch):
+def test_outbox_failure_rolls_back_terminal_transition(monkeypatch):
     job_id = str(uuid.uuid4())
-    _add_job(job_id)
+    _add_job(job_id, webhook=True)
+    attempt, _ = tasks._claim_job(job_id)
+    assert attempt == 1
 
-    async def fake_harvest(*, model_name, url, api_key):
-        return {"title": "Example"}
+    def fail(*args, **kwargs):
+        raise RuntimeError("outbox unavailable")
 
-    monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    calls = _noop_dispatch(monkeypatch)
-
-    tasks._run_harvest(
-        job_id,
-        model="gemini-2.5-flash",
-        url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
-        webhook_url="https://receiver.example.com/hook",
-        encrypted_webhook_secret=encrypt_task_secret("supersecretvalue123456"),
-    )
-
-    assert len(calls) == 1
-    assert calls[0]["event"] == "job.completed"
-    assert calls[0]["webhook_url"] == "https://receiver.example.com/hook"
-    assert "supersecretvalue123456" not in calls[0]["encrypted_webhook_secret"]
-    assert calls[0]["payload"]["job_id"] == job_id
-
-
-def test_run_harvest_dispatches_webhook_on_failure(monkeypatch):
-    job_id = str(uuid.uuid4())
-    _add_job(job_id)
-
-    async def fake_harvest(*, model_name, url, api_key):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    calls = _noop_dispatch(monkeypatch)
-
-    with pytest.raises(RuntimeError):
-        tasks._run_harvest(
+    monkeypatch.setattr(tasks, "_ensure_webhook_outbox", fail)
+    with pytest.raises(RuntimeError, match="outbox unavailable"):
+        tasks._complete_job(
             job_id,
-            model="gemini-2.5-flash",
-            url="https://example.com",
-            encrypted_api_key=encrypt_task_secret("k"),
-            webhook_url="https://receiver.example.com/hook",
+            attempt,
+            status="success",
+            result={"title": "Example"},
+            logs="",
+            error=None,
         )
 
-    assert len(calls) == 1
-    assert calls[0]["event"] == "job.failed"
+    job = _get_job(job_id)
+    assert job.status == "pending"
+    assert job.result is None
 
 
-def test_run_harvest_without_webhook_does_not_dispatch(monkeypatch):
+def test_pending_duplicate_does_not_restart_harvest(monkeypatch):
     job_id = str(uuid.uuid4())
-    _add_job(job_id)
-
-    async def fake_harvest(*, model_name, url, api_key):
-        return {"title": "Example"}
-
-    monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    calls = _noop_dispatch(monkeypatch)
-
-    tasks._run_harvest(
-        job_id,
-        model="gemini-2.5-flash",
-        url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
-    )
-
-    assert calls == []
-
-
-def test_webhook_enqueue_failure_does_not_overwrite_success(monkeypatch):
-    job_id = str(uuid.uuid4())
-    _add_job(job_id)
-
-    async def fake_harvest(*, model_name, url, api_key):
-        return {"title": "Example"}
-
-    class FailingWebhook:
-        @staticmethod
-        def apply_async(*, kwargs, task_id):
-            raise RuntimeError("broker unavailable")
-
-    monkeypatch.setattr(tasks, "metadata_harvest", fake_harvest)
-    monkeypatch.setattr(tasks, "dispatch_webhook", FailingWebhook())
-
-    payload = tasks._run_harvest(
-        job_id,
-        model="gemini-2.5-flash",
-        url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
-        webhook_url="https://receiver.example.com/hook",
-    )
-
-    assert payload["status"] == "success"
-    row = _get_job(job_id)
-    assert row.status == "success"
-    assert row.webhook_error == "dispatch_failed"
-
-
-def test_terminal_redelivery_does_not_run_harvester(monkeypatch):
-    job_id = str(uuid.uuid4())
-    _add_job(job_id)
-    with SessionLocal() as db:
-        row = db.get(Job, job_id)
-        row.status = "success"
-        row.result = {"title": "Already done"}
-        db.commit()
+    _add_job(job_id, status="pending")
 
     async def unexpected_harvest(**kwargs):
-        raise AssertionError("terminal job was harvested again")
+        raise AssertionError("pending job was harvested again")
 
     monkeypatch.setattr(tasks, "metadata_harvest", unexpected_harvest)
     payload = tasks._run_harvest(
         job_id,
         model="gemini-2.5-flash",
         url="https://example.com",
-        encrypted_api_key=encrypt_task_secret("k"),
+        api_key="k",
     )
-
-    assert payload["result"] == {"title": "Already done"}
-    assert _get_job(job_id).execution_attempts == 0
+    assert payload["status"] == "pending"
 
 
-def test_reconcile_stale_jobs_marks_pending_and_queued():
-    now = datetime.now(UTC)
-    with SessionLocal() as db:
-        db.add_all(
-            [
-                Job(
-                    job_id="old-pending",
-                    model="m",
-                    url="https://example.com",
-                    status="pending",
-                    updated_at=now - timedelta(days=2),
-                ),
-                Job(
-                    job_id="old-queued",
-                    model="m",
-                    url="https://example.com",
-                    status="queued",
-                    updated_at=now - timedelta(days=2),
-                ),
-                Job(
-                    job_id="recent-pending",
-                    model="m",
-                    url="https://example.com",
-                    status="pending",
-                    updated_at=now,
-                ),
-            ]
-        )
-        db.commit()
+def test_terminal_duplicate_does_not_restart_harvest(monkeypatch):
+    job_id = str(uuid.uuid4())
+    _add_job(job_id, status="success")
+
+    async def unexpected_harvest(**kwargs):
+        raise AssertionError("terminal job was harvested again")
+
+    monkeypatch.setattr(tasks, "metadata_harvest", unexpected_harvest)
+    assert tasks._run_harvest(
+        job_id,
+        model="gemini-2.5-flash",
+        url="https://example.com",
+        api_key="k",
+    )["status"] == "success"
+
+
+def test_reconcile_stale_jobs_creates_failure_outbox():
+    old = datetime.now(UTC) - timedelta(days=2)
+    _add_job("old-pending", status="pending", webhook=True, updated_at=old)
+    _add_job("old-queued", status="queued", webhook=True, updated_at=old)
+    _add_job("recent", status="pending", updated_at=datetime.now(UTC))
 
     assert tasks.reconcile_stale_jobs.run() == 2
     assert _get_job("old-pending").error == "worker_lost"
     assert _get_job("old-queued").error == "dispatch_lost"
-    assert _get_job("recent-pending").status == "pending"
+    assert _get_outbox("old-pending").event == "job.failed"
+    assert _get_outbox("old-queued").event == "job.failed"
+    assert _get_job("recent").status == "pending"

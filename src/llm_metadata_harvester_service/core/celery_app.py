@@ -4,8 +4,8 @@ from llm_metadata_harvester_service.core.config import (
     CELERY_BROKER_URL,
     CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
     CELERY_TASK_TIME_LIMIT_SECONDS,
-    CELERY_VISIBILITY_TIMEOUT_SECONDS,
     JOB_RECONCILE_INTERVAL_SECONDS,
+    WEBHOOK_OUTBOX_INTERVAL_SECONDS,
 )
 
 celery_app = Celery(
@@ -27,16 +27,13 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
     task_ignore_result=True,
-    task_acks_late=True,
+    task_acks_late=False,
     task_acks_on_failure_or_timeout=True,
-    task_reject_on_worker_lost=True,
-    task_default_delivery_mode=2,
+    task_reject_on_worker_lost=False,
+    task_default_delivery_mode=1,
     worker_prefetch_multiplier=1,
     task_soft_time_limit=CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
     task_time_limit=CELERY_TASK_TIME_LIMIT_SECONDS,
-    broker_transport_options={
-        "visibility_timeout": CELERY_VISIBILITY_TIMEOUT_SECONDS
-    },
     beat_schedule={
         "reconcile-stale-jobs": {
             "task": (
@@ -45,6 +42,14 @@ celery_app.conf.update(
             ),
             "schedule": JOB_RECONCILE_INTERVAL_SECONDS,
             "options": {"expires": JOB_RECONCILE_INTERVAL_SECONDS},
-        }
+        },
+        "publish-pending-webhooks": {
+            "task": (
+                "llm_metadata_harvester_service.workers.webhook."
+                "publish_pending_webhooks"
+            ),
+            "schedule": WEBHOOK_OUTBOX_INTERVAL_SECONDS,
+            "options": {"expires": WEBHOOK_OUTBOX_INTERVAL_SECONDS},
+        },
     },
 )

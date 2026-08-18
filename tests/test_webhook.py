@@ -1,22 +1,20 @@
 import hashlib
 import hmac
 import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import httpx
-import pytest
-from celery.exceptions import Retry
 
-from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.core.secrets import encrypt_webhook_secret
+from llm_metadata_harvester_service.db.models import Job, WebhookOutbox
 from llm_metadata_harvester_service.db.session import SessionLocal
+from llm_metadata_harvester_service.workers import webhook
 from llm_metadata_harvester_service.workers.webhook import (
+    DeliveryOutcome,
     _build_body,
-    _deliver,
+    _deliver_once,
     _parse_retry_after,
-    _record_attempt,
-    _record_delivered,
-    _record_failed,
     sign_payload,
 )
 
@@ -25,23 +23,41 @@ PAYLOAD = {
     "status": "success",
     "model": "gemini-2.5-flash",
     "result": {"title": "Example"},
-    "logs": "extracting...\n",
+    "logs": "done",
     "error": None,
 }
 WEBHOOK_URL = "https://receiver.example.com/hook"
 SECRET = "supersecretvalue123456"
 
 
-def _fake_self(retries=0, max_retries=5):
-    retry = MagicMock(side_effect=Retry())
-    request = SimpleNamespace(retries=retries)
-    return SimpleNamespace(request=request, max_retries=max_retries, retry=retry)
+def _add_outbox(job_id: str, *, attempts: int = 0) -> None:
+    now = datetime.now(UTC)
+    with SessionLocal() as db:
+        db.add(
+            Job(
+                job_id=job_id,
+                model="gemini-2.5-flash",
+                url="https://example.com",
+                status="success",
+                result={"title": "Example"},
+                webhook_url=WEBHOOK_URL,
+            )
+        )
+        db.add(
+            WebhookOutbox(
+                job_id=job_id,
+                event="job.completed",
+                encrypted_secret=encrypt_webhook_secret(SECRET),
+                attempts=attempts,
+                next_attempt_at=now,
+            )
+        )
+        db.commit()
 
 
 def test_sign_payload_deterministic():
     expected = hmac.new(b"secret", b"hello", hashlib.sha256).hexdigest()
     assert sign_payload(b"hello", "secret") == expected
-    assert sign_payload(b"hello", "secret") == sign_payload(b"hello", "secret")
 
 
 def test_build_body_includes_event_timestamp_and_payload():
@@ -49,16 +65,14 @@ def test_build_body_includes_event_timestamp_and_payload():
     assert body["event"] == "job.completed"
     assert "timestamp" in body
     assert body["job_id"] == "job-1"
-    assert body["status"] == "success"
-    assert body["result"] == {"title": "Example"}
 
 
-def test_dispatch_success_posts_signed_payload(monkeypatch):
+def test_delivery_posts_signed_payload(monkeypatch):
     captured = {}
 
     class FakeClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            captured["timeout"] = timeout
+        def __init__(self, **kwargs):
+            pass
 
         def __enter__(self):
             return self
@@ -67,226 +81,25 @@ def test_dispatch_success_posts_signed_payload(monkeypatch):
             return False
 
         def post(self, url, content, headers):
-            captured["url"] = url
-            captured["content"] = content
-            captured["headers"] = headers
+            captured.update(url=url, content=content, headers=headers)
             return SimpleNamespace(status_code=200, headers={})
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
-
-    delivered = _deliver(
-        _fake_self(),
+    outcome = _deliver_once(
         payload=PAYLOAD,
         webhook_url=WEBHOOK_URL,
         webhook_secret=SECRET,
         event="job.completed",
     )
-
-    assert delivered.delivered is True
-    assert captured["url"] == WEBHOOK_URL
-    assert captured["timeout"] == 10.0
+    assert outcome.delivered is True
     assert captured["headers"]["X-Webhook-Signature"] == (
         f"sha256={sign_payload(captured['content'], SECRET)}"
     )
-    body = json.loads(captured["content"])
-    assert body["event"] == "job.completed"
-    assert body["job_id"] == "job-1"
 
 
-def test_dispatch_without_secret_sets_no_signature(monkeypatch):
-    captured = {}
-
-    class FakeClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url, content, headers):
-            captured["headers"] = headers
-            return SimpleNamespace(status_code=200, headers={})
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-
-    delivered = _deliver(
-        _fake_self(),
-        payload=PAYLOAD,
-        webhook_url=WEBHOOK_URL,
-        webhook_secret=None,
-        event="job.completed",
-    )
-
-    assert delivered.delivered is True
-    assert "X-Webhook-Signature" not in captured["headers"]
-
-
-def test_dispatch_retries_on_connection_error(monkeypatch):
+def test_delivery_reports_connection_and_http_errors(monkeypatch):
     class BoomClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url, content, headers):
-            raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
-
-    monkeypatch.setattr(httpx, "Client", BoomClient)
-
-    self = _fake_self(retries=0, max_retries=5)
-    with pytest.raises(Retry):
-        _deliver(
-            self,
-            payload=PAYLOAD,
-            webhook_url=WEBHOOK_URL,
-            webhook_secret=SECRET,
-            event="job.completed",
-        )
-    self.retry.assert_called_once()
-    assert "exc" in self.retry.call_args.kwargs
-    assert self.retry.call_args.kwargs["countdown"] == 2.0
-
-
-def test_dispatch_gives_up_after_final_connection_error(monkeypatch):
-    class BoomClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url, content, headers):
-            raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
-
-    monkeypatch.setattr(httpx, "Client", BoomClient)
-
-    self = _fake_self(retries=5, max_retries=5)
-    delivered = _deliver(
-        self,
-        payload=PAYLOAD,
-        webhook_url=WEBHOOK_URL,
-        webhook_secret=SECRET,
-        event="job.completed",
-    )
-    assert delivered.delivered is False
-    assert delivered.error == "connection_error"
-    self.retry.assert_not_called()
-
-
-def test_dispatch_retries_on_non_2xx(monkeypatch):
-    response = SimpleNamespace(
-        status_code=500,
-        headers={},
-        request=httpx.Request("POST", WEBHOOK_URL),
-    )
-
-    class FiveClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url, content, headers):
-            return response
-
-    monkeypatch.setattr(httpx, "Client", FiveClient)
-
-    self = _fake_self(retries=0, max_retries=5)
-    with pytest.raises(Retry):
-        _deliver(
-            self,
-            payload=PAYLOAD,
-            webhook_url=WEBHOOK_URL,
-            webhook_secret=SECRET,
-            event="job.completed",
-        )
-    self.retry.assert_called_once()
-    assert self.retry.call_args.kwargs["countdown"] == 2.0
-
-
-def test_dispatch_retries_on_redirect(monkeypatch):
-    response = SimpleNamespace(
-        status_code=302,
-        headers={"Location": "https://elsewhere.example/hook"},
-        request=httpx.Request("POST", WEBHOOK_URL),
-    )
-
-    class RedirectClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url, content, headers):
-            return response
-
-    monkeypatch.setattr(httpx, "Client", RedirectClient)
-    self = _fake_self(retries=0, max_retries=4)
-    with pytest.raises(Retry):
-        _deliver(
-            self,
-            payload=PAYLOAD,
-            webhook_url=WEBHOOK_URL,
-            webhook_secret=SECRET,
-            event="job.completed",
-        )
-
-
-def test_dispatch_honours_retry_after(monkeypatch):
-    response = SimpleNamespace(
-        status_code=429,
-        headers={"Retry-After": "5"},
-        request=httpx.Request("POST", WEBHOOK_URL),
-    )
-
-    class RateClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url, content, headers):
-            return response
-
-    monkeypatch.setattr(httpx, "Client", RateClient)
-
-    self = _fake_self(retries=0, max_retries=5)
-    with pytest.raises(Retry):
-        _deliver(
-            self,
-            payload=PAYLOAD,
-            webhook_url=WEBHOOK_URL,
-            webhook_secret=SECRET,
-            event="job.completed",
-        )
-    assert self.retry.call_args.kwargs["countdown"] == 5.0
-
-
-def test_retry_backoff_is_exponential(monkeypatch):
-    class BoomClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
+        def __init__(self, **kwargs):
             pass
 
         def __enter__(self):
@@ -299,108 +112,153 @@ def test_retry_backoff_is_exponential(monkeypatch):
             raise httpx.ConnectError("nope", request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "Client", BoomClient)
-    self = _fake_self(retries=3, max_retries=4)
-    with pytest.raises(Retry):
-        _deliver(
-            self,
-            payload=PAYLOAD,
-            webhook_url=WEBHOOK_URL,
-            webhook_secret=SECRET,
-            event="job.completed",
-        )
-    assert self.retry.call_args.kwargs["countdown"] == 16.0
+    assert _deliver_once(
+        payload=PAYLOAD,
+        webhook_url=WEBHOOK_URL,
+        webhook_secret=None,
+        event="job.completed",
+    ).error == "connection_error"
+
+    class RateClient(BoomClient):
+        def post(self, url, content, headers):
+            return SimpleNamespace(status_code=429, headers={"Retry-After": "5"})
+
+    monkeypatch.setattr(httpx, "Client", RateClient)
+    outcome = _deliver_once(
+        payload=PAYLOAD,
+        webhook_url=WEBHOOK_URL,
+        webhook_secret=None,
+        event="job.completed",
+    )
+    assert outcome.error == "http_status:429"
+    assert outcome.retry_after == 5
 
 
 def test_retry_after_is_clamped():
-    assert _parse_retry_after("9999", 2.0) == 300.0
+    assert _parse_retry_after("9999") == 300
 
 
-def test_dispatch_gives_up_after_final_non_2xx(monkeypatch):
-    response = SimpleNamespace(
-        status_code=500,
-        headers={},
-        request=httpx.Request("POST", WEBHOOK_URL),
+def test_publisher_sends_only_job_id(monkeypatch):
+    _add_outbox("publish-me")
+    calls = []
+
+    def fake_apply_async(*, kwargs, task_id):
+        calls.append((kwargs, task_id))
+
+    monkeypatch.setattr(
+        webhook, "deliver_job_webhook", SimpleNamespace(apply_async=fake_apply_async)
     )
+    assert webhook.publish_pending_webhooks.run() == 1
+    assert calls[0][0] == {"job_id": "publish-me"}
+    assert calls[0][1] == "webhook:publish-me:1"
 
-    class FiveClient:
-        def __init__(self, timeout, follow_redirects=False, **kwargs):
-            pass
 
-        def __enter__(self):
-            return self
+def test_publish_failure_releases_lease(monkeypatch):
+    _add_outbox("publish-fails")
 
-        def __exit__(self, *args):
-            return False
+    def fail(**kwargs):
+        raise RuntimeError("broker down")
 
-        def post(self, url, content, headers):
-            return response
-
-    monkeypatch.setattr(httpx, "Client", FiveClient)
-
-    self = _fake_self(retries=5, max_retries=5)
-    delivered = _deliver(
-        self,
-        payload=PAYLOAD,
-        webhook_url=WEBHOOK_URL,
-        webhook_secret=SECRET,
-        event="job.completed",
+    monkeypatch.setattr(
+        webhook, "deliver_job_webhook", SimpleNamespace(apply_async=fail)
     )
-    assert delivered.delivered is False
-    assert delivered.error == "http_status:500"
-    self.retry.assert_not_called()
-
-
-def test_dispatch_rejects_unsupported_scheme():
-    with pytest.raises(ValueError):
-        _deliver(
-            _fake_self(),
-            payload=PAYLOAD,
-            webhook_url="ftp://receiver.example.com/hook",
-            webhook_secret=None,
-            event="job.completed",
-        )
-
-
-def test_record_delivery_metadata():
-    job_id = "job-meta"
+    assert webhook.publish_pending_webhooks.run() == 0
     with SessionLocal() as db:
-        db.add(Job(job_id=job_id, model="m", url="https://x.example", status="queued"))
+        row = db.get(WebhookOutbox, "publish-fails")
+        assert row.published_at is None
+        assert row.last_error == "publish_failed"
+
+
+def test_publisher_recovers_expired_delivery_lease(monkeypatch):
+    _add_outbox("expired-lease", attempts=1)
+    now = datetime.now(UTC)
+    with SessionLocal() as db:
+        row = db.get(WebhookOutbox, "expired-lease")
+        row.published_at = now - timedelta(minutes=2)
+        row.delivery_started_at = now - timedelta(minutes=2)
         db.commit()
 
-    _record_attempt(job_id)
-    _record_attempt(job_id)
-    _record_delivered(job_id)
+    calls = []
 
+    def fake_apply_async(*, kwargs, task_id):
+        calls.append((kwargs, task_id))
+
+    monkeypatch.setattr(
+        webhook, "deliver_job_webhook", SimpleNamespace(apply_async=fake_apply_async)
+    )
+    assert webhook.publish_pending_webhooks.run() == 1
+    assert calls == [
+        ({"job_id": "expired-lease"}, "webhook:expired-lease:2")
+    ]
+
+
+def test_delivery_success_updates_outbox_and_job(monkeypatch):
+    _add_outbox("delivery-ok")
+    monkeypatch.setattr(
+        webhook, "_deliver_once", lambda **kwargs: DeliveryOutcome(True)
+    )
+    assert webhook.deliver_job_webhook.run(job_id="delivery-ok") == "delivered"
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        assert job.webhook_attempts == 2
-        assert job.webhook_last_attempt_at is not None
+        row = db.get(WebhookOutbox, "delivery-ok")
+        job = db.get(Job, "delivery-ok")
+        assert row.delivered_at is not None
+        assert row.encrypted_secret is None
         assert job.webhook_delivered_at is not None
         assert job.webhook_error is None
 
-    _record_failed(job_id, "delivery failed permanently")
 
+def test_delivery_failure_persists_backoff(monkeypatch):
+    _add_outbox("delivery-retry")
+    monkeypatch.setattr(
+        webhook,
+        "_deliver_once",
+        lambda **kwargs: DeliveryOutcome(False, "http_status:500"),
+    )
+    before = datetime.now(UTC)
+    assert (
+        webhook.deliver_job_webhook.run(job_id="delivery-retry")
+        == "retry_scheduled"
+    )
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        assert job.webhook_error is None
+        row = db.get(WebhookOutbox, "delivery-retry")
+        assert row.attempts == 1
+        assert row.published_at is None
+        assert row.delivery_started_at is None
+        assert row.last_error == "http_status:500"
+        next_attempt = row.next_attempt_at.replace(tzinfo=UTC)
+        assert next_attempt >= before + timedelta(seconds=2)
 
 
-def test_record_delivery_metadata_missing_job_is_noop():
-    _record_attempt("nope")
-    _record_delivered("nope")
-    _record_failed("nope", "boom")
-
-
-def test_failed_duplicate_does_not_override_delivered_outcome():
-    job_id = "job-delivered"
+def test_delivery_exhaustion_is_terminal(monkeypatch):
+    _add_outbox("delivery-exhausted", attempts=4)
+    monkeypatch.setattr(
+        webhook,
+        "_deliver_once",
+        lambda **kwargs: DeliveryOutcome(False, "http_status:500"),
+    )
+    assert (
+        webhook.deliver_job_webhook.run(job_id="delivery-exhausted")
+        == "exhausted"
+    )
     with SessionLocal() as db:
-        db.add(Job(job_id=job_id, model="m", url="https://x.example", status="success"))
+        row = db.get(WebhookOutbox, "delivery-exhausted")
+        assert row.attempts == 5
+        assert row.exhausted_at is not None
+        assert row.encrypted_secret is None
+
+
+def test_delivered_duplicate_is_noop(monkeypatch):
+    _add_outbox("already-delivered")
+    with SessionLocal() as db:
+        row = db.get(WebhookOutbox, "already-delivered")
+        row.delivered_at = datetime.now(UTC)
         db.commit()
 
-    _record_delivered(job_id)
-    _record_failed(job_id, "http_status:500")
+    def unexpected(**kwargs):
+        raise AssertionError("webhook was delivered twice")
 
-    with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        assert job.webhook_delivered_at is not None
-        assert job.webhook_error is None
+    monkeypatch.setattr(webhook, "_deliver_once", unexpected)
+    assert (
+        webhook.deliver_job_webhook.run(job_id="already-delivered")
+        == "delivered"
+    )

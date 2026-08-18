@@ -70,9 +70,8 @@ def test_submit_job_creates_row_and_enqueues(fake_runner):
     assert task_id == body["job_id"]
     assert kwargs["url"] == "https://example.com"
     assert kwargs["model"] == "gemini-2.5-flash"
-    assert "test-key" not in kwargs["encrypted_api_key"]
-    assert kwargs["webhook_url"] == "https://receiver.example.com/hook"
-    assert kwargs["encrypted_webhook_secret"] is None
+    assert kwargs["api_key"] == "test-key"
+    assert set(kwargs) == {"model", "url", "api_key"}
 
     with SessionLocal() as db:
         row = db.get(Job, body["job_id"])
@@ -96,7 +95,11 @@ def test_submit_encrypts_webhook_secret(fake_runner):
     )
     assert response.status_code == 202
     _, kwargs = fake_runner.calls[0]
-    assert secret not in kwargs["encrypted_webhook_secret"]
+    assert set(kwargs) == {"model", "url", "api_key"}
+    with SessionLocal() as db:
+        job = db.get(Job, response.json()["job_id"])
+        assert job.webhook_secret_encrypted is not None
+        assert secret not in job.webhook_secret_encrypted
 
 def test_submit_job_rejects_bad_webhook_url():
     resp = client.post(
