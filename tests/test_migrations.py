@@ -3,7 +3,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.schema import CreateTable
 
-from llm_metadata_harvester_service.db.models import Job
+from llm_metadata_harvester_service.db.models import Job, WebhookOutbox
 from llm_metadata_harvester_service.db.session import engine
 
 
@@ -22,6 +22,17 @@ def test_migration_created_jobs_schema():
         constraint["name"] for constraint in inspector.get_check_constraints("jobs")
     }
     assert "execution_attempts" in str(CreateTable(Job.__table__).compile(engine))
+    assert "webhook_secret_encrypted" in columns
+    assert "webhook_outbox" in inspector.get_table_names()
+    assert "encrypted_secret" in {
+        column["name"] for column in inspector.get_columns("webhook_outbox")
+    }
+    assert "ix_webhook_outbox_due" in {
+        index["name"] for index in inspector.get_indexes("webhook_outbox")
+    }
+    assert "encrypted_secret" in str(
+        CreateTable(WebhookOutbox.__table__).compile(engine)
+    )
 
 
 def test_legacy_schema_upgrades_from_baseline(tmp_path, monkeypatch):

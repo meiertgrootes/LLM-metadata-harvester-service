@@ -1,7 +1,16 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, DateTime, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from llm_metadata_harvester_service.db.session import Base
@@ -23,6 +32,7 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     webhook_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    webhook_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_attempts: Mapped[int] = mapped_column(Integer, default=0)
     webhook_last_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -55,4 +65,49 @@ class Job(Base):
         ),
         Index("ix_jobs_batch_id_status", "batch_id", "status"),
         Index("ix_jobs_status_updated_at", "status", "updated_at"),
+    )
+
+
+class WebhookOutbox(Base):
+    __tablename__ = "webhook_outbox"
+
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("jobs.job_id", ondelete="CASCADE"), primary_key=True
+    )
+    event: Mapped[str] = mapped_column(String(32))
+    encrypted_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivery_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    exhausted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_webhook_outbox_due",
+            "delivered_at",
+            "exhausted_at",
+            "next_attempt_at",
+            "published_at",
+        ),
     )
