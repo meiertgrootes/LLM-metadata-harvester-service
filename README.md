@@ -59,17 +59,19 @@ delete
 ## Installation
 The service is provided in a fully containerized format and can be deployed using either docker or nerdctl/containerd. There are 3 deployment modes available: `dev` (development), `local` (local production), and `public` (hardend production for public facing deployment).
 
-The service persists submitted jobs and their results in PostgreSQL. Redis is the
-Celery broker and uses append-only-file persistence. Completed results remain
-retrievable indefinitely. Celery tasks use late acknowledgement and bounded
-execution attempts; a periodic reconciliation process marks stale jobs failed.
-Webhook receivers should nevertheless be idempotent because task and webhook
-delivery are at least once.
+The service persists submitted jobs and their results in PostgreSQL. Redis is an
+intentionally nonpersistent Celery broker: queued or running harvests may be
+lost when Redis or a worker restarts. A periodic reconciliation process marks
+their database rows failed as `dispatch_lost` or `worker_lost`.
+Both Redis RDB snapshots and AOF are disabled, and no Redis data volume is
+mounted, so provider API keys in queued task messages are not written to disk
+by the service configuration.
 
-Operational failures detected later by stale-job reconciliation are persisted
-with `worker_lost` or `dispatch_lost` and remain visible through the polling
-endpoints. They do not emit signed webhooks because webhook signing secrets are
-deliberately not stored in PostgreSQL.
+Webhook delivery is durable independently of harvest execution. Every terminal
+job creates a PostgreSQL outbox row in the same transaction as its result. Beat
+re-publishes due outbox rows after Redis or worker recovery, and delivery tasks
+carry only a `job_id`. Receivers should remain idempotent because outbox
+delivery is at least once.
 
 
 To run the service in local production mode users should follow the steps listed below
@@ -106,16 +108,17 @@ To run the service in local production mode users should follow the steps listed
 Database schema upgrades run automatically through a one-shot Alembic migration
 service before the API and workers start.
 
-Before starting any track, set `TASK_SECRET_KEY` to a stable Fernet key. It
-encrypts provider API keys and webhook signing secrets before Celery messages
-are written to the persistent Redis broker. Generate one with:
+Before starting any track, set `WEBHOOK_SECRET_KEY` to a stable Fernet key. It
+encrypts webhook signing secrets stored in the PostgreSQL outbox. Provider API
+keys are sent only through the transient Redis harvest queue and are never
+stored in PostgreSQL. Generate the webhook key with:
 
 ```bash
 python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 ```
 
 Use the same key for API and worker, store it in a secret manager or local
-`.env`, and do not rotate it while queued jobs still exist.
+`.env`, and do not rotate it while undelivered outbox rows still exist.
 
 3. Shutdown
    The service can be shutdown with
