@@ -9,8 +9,11 @@ from pathlib import Path
 _TMPDIR = tempfile.mkdtemp(prefix="llm-harvester-tests-")
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDIR}/test.db"
 os.environ["CELERY_BROKER_URL"] = "memory://"
+os.environ["WEBHOOK_ALLOWED_HOSTS"] = "receiver.example.com"
+os.environ["TASK_SECRET_KEY"] = "o1pxvABKy2_-zKRx2m60YhBvsRqGXTNgSbh7wAwmOPY="
 
 SRC = Path(__file__).resolve().parent.parent / "src"
+ROOT = SRC.parent
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -30,11 +33,12 @@ sys.modules.setdefault("llm_metadata_harvester", harvester)
 sys.modules.setdefault("llm_metadata_harvester.harvester_operations", harvester_ops)
 
 import pytest  # noqa: E402
+from alembic import command  # noqa: E402
+from alembic.config import Config  # noqa: E402
 
-from llm_metadata_harvester_service.db.init import init_db  # noqa: E402
 from llm_metadata_harvester_service.db.session import Base, SessionLocal  # noqa: E402
 
-init_db()
+command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
 
 
 @pytest.fixture(autouse=True)
