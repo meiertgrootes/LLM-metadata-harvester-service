@@ -59,7 +59,17 @@ delete
 ## Installation
 The service is provided in a fully containerized format and can be deployed using either docker or nerdctl/containerd. There are 3 deployment modes available: `dev` (development), `local` (local production), and `public` (hardend production for public facing deployment).
 
-The service persists submitted jobs and their results in a PostgreSQL database, which is started automatically as part of each deployment track. Redis is used only as the Celery broker (task queue); completed results are stored in the database and remain retrievable indefinitely.
+The service persists submitted jobs and their results in PostgreSQL. Redis is the
+Celery broker and uses append-only-file persistence. Completed results remain
+retrievable indefinitely. Celery tasks use late acknowledgement and bounded
+execution attempts; a periodic reconciliation process marks stale jobs failed.
+Webhook receivers should nevertheless be idempotent because task and webhook
+delivery are at least once.
+
+Operational failures detected later by stale-job reconciliation are persisted
+with `worker_lost` or `dispatch_lost` and remain visible through the polling
+endpoints. They do not emit signed webhooks because webhook signing secrets are
+deliberately not stored in PostgreSQL.
 
 
 To run the service in local production mode users should follow the steps listed below
@@ -92,6 +102,20 @@ To run the service in local production mode users should follow the steps listed
    ```bash
    docker compose -f nerdctl-compose.local.yml up --build -d
    ```
+
+Database schema upgrades run automatically through a one-shot Alembic migration
+service before the API and workers start.
+
+Before starting any track, set `TASK_SECRET_KEY` to a stable Fernet key. It
+encrypts provider API keys and webhook signing secrets before Celery messages
+are written to the persistent Redis broker. Generate one with:
+
+```bash
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Use the same key for API and worker, store it in a secret manager or local
+`.env`, and do not rotate it while queued jobs still exist.
 
 3. Shutdown
    The service can be shutdown with
@@ -190,7 +214,15 @@ The body of the `POST` request is JSON:
 
 - `event` is `job.completed` on success or `job.failed` on failure.
 - On failure `result` is `null` and `error` holds a short error code (currently `harvest_failed`); detailed logs are in `logs`.
-- A receiver should reply with `2xx` to acknowledge delivery. Delivery is retried with exponential backoff (about 2s to 32s, 5 attempts) on non-2xx responses or connection errors, honouring a `Retry-After` header when present.
+- A receiver must reply with `2xx` to acknowledge delivery. Redirects are not
+  followed. Delivery makes five total attempts with exponential backoff (about
+  2s to 16s between retries) on non-2xx responses or connection errors. A
+  `Retry-After` header is honoured up to the configured maximum.
+- Webhook destinations must resolve only to public IP addresses. Private,
+  loopback, link-local, reserved, and unresolvable destinations are rejected.
+  Delivery connects to the validated address while preserving the original
+  hostname for HTTP and TLS, preventing a second DNS lookup from rebinding the
+  request to an internal address.
 
 ### Verifying the signature
 
@@ -209,13 +241,26 @@ const expected = crypto
 
 ### Testing webhooks
 
-For local development a small receiver is provided:
+For local development a small receiver is provided. Install the API dependencies
+if running it directly on the host:
 
 ```bash
-python scripts/webhook_receiver.py   # listens on http://localhost:8080
+pip install ".[api]"
+WEBHOOK_RECEIVER_SECRET='<matching-secret>' python scripts/webhook_receiver.py
 ```
 
-then submit jobs with `"webhook_url": "http://localhost:8080/"` (and, if used, `WEBHOOK_RECEIVER_SECRET` matching `webhook_secret`). Public test endpoints such as <https://webhook.site> can also be used.
+Webhook delivery originates in the worker container, so `localhost` refers to
+that container and cannot reach a receiver on the host. On Docker Desktop use
+`http://host.docker.internal:8080/` and explicitly set
+`WEBHOOK_ALLOWED_HOSTS=host.docker.internal` on both API and worker for this
+development-only exception. For nerdctl/Lima, use its configured host alias or
+run a receiver container on the Compose network and allowlist that container
+name. A publicly reachable receiver such as <https://webhook.site> requires no
+development allowlist.
+
+The allowlist bypasses private-address protection and must remain empty in the
+public deployment. Network egress rules that block private and link-local ranges
+are recommended as defense in depth against DNS rebinding.
 
 > **Note for the `public` deployment track:** webhook delivery is performed by the worker container, which requires outbound internet access. The `nerdctl-compose.public.yml` attaches the worker to the `public` network for this purpose. Operators should also override the default PostgreSQL credentials (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` environment variables) for the `public` track.
 
@@ -292,6 +337,45 @@ nerdctl
 
   and shut down accordingly.
 
+## Database migrations
+
+Alembic owns the production schema. New deployments run `alembic upgrade head`
+through the `migrate` service. `Base.metadata.create_all()` is not run by the API
+or worker.
+
+If a local/dev PostgreSQL volume was created before Alembic was introduced:
+
+- For disposable data, run `docker compose -f nerdctl-compose.local.yml down -v`
+  and start again.
+- To preserve data, verify that the existing `jobs` table matches the schema
+  introduced before Alembic, then run the migration image once with
+  `alembic stamp 0001` followed by `alembic upgrade head`. Revision `0002` adds
+  the recovery column, constraint, and index. Back up the database first.
+
+Some nerdctl versions do not enforce conditional `depends_on`. The safe fallback
+is to start PostgreSQL and Redis, run `migrate` explicitly, and then start the
+remaining services:
+
+```bash
+sudo nerdctl compose -f nerdctl-compose.local.yml up -d postgres redis
+sudo nerdctl compose -f nerdctl-compose.local.yml run --rm migrate
+sudo nerdctl compose -f nerdctl-compose.local.yml up -d api worker beat nginx
+```
+
+## Health checks
+
+- `/health/live` verifies that FastAPI can serve requests.
+- `/health/ready` verifies PostgreSQL and Redis connectivity.
+
+Nginx proxies these endpoints to FastAPI; they are not synthetic proxy health
+responses. Worker availability can be checked with:
+
+```bash
+docker compose -f nerdctl-compose.local.yml exec -T worker \
+  celery -A llm_metadata_harvester_service.core.celery_app.celery_app \
+  inspect ping --timeout 10
+```
+
 <!---
 - _notes on how to contribute_
 --->
@@ -325,26 +409,22 @@ and on lines 49-56
 the server name correspoinding to the deployment must be specified. Furthermore, `/certs` must be created in the root of the repository (if it doesn't exist) and the required SSL certificates and keys must be placed there.
 
 ## Configure nerdctl-compose.public.yml
-After editing `nginx.public.conf` as specified above `nerdctl-compose.public.yml` must also be edited. Specifically on line 30-44
+The public Compose track already publishes ports 80 and 443 and mounts
+`./certs` read-only. Before starting it, create `certs/` and provide exactly:
 
-```
-nginx:
-    image: nginx:1.25-alpine
-    ports:
-      - "80:80"
-      # future TLS
-      # - "443:443"
-    volumes:
-      - ./nginx/nginx.public.conf:/etc/nginx/nginx.conf:ro
-     # - ./certs:/etc/nginx/certs:ro            <-- certificates must be placed and loaded 
-    depends_on:
-      - api
-    restart: unless-stopped
-    networks:
-      - internal
-      - public
-```
-The ports for TLS must be exposed and the certificates mounted.
+- `certs/fullchain.pem`
+- `certs/privkey.pem`
+
+Replace `api.yourdomain.tld` in both server blocks in
+`nginx/nginx.public.conf`. These certificates are required only for the public
+track. Local and development deployments remain HTTP-only and require no
+certificates.
+
+Set `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `DATABASE_URL` in a
+local `.env` file based on `.env.example`. URL-encode special characters in the
+password used by `DATABASE_URL`. Changing `POSTGRES_*` does not modify an
+already initialized PostgreSQL volume; rotate existing database credentials
+inside PostgreSQL or initialize a new volume.
 
 ## Host firewall
 Finally, it must be ensured that ports 80 and 443 are open on the host firewall
@@ -353,7 +433,8 @@ Finally, it must be ensured that ports 80 and 443 are open on the host firewall
 Having completed the required edits and configurations the `public` mode of the service can be deployed as follows
 
 ### 1. Build production images
-The `public` mode makes use of the same containerimages as the local mode. Accordingly first run
+The `public` mode uses the API, worker, and migration images built by local mode.
+Accordingly first run
 
 ```bash
 sudo nerdctl compose -f nerdctl-compose.local.yml build
@@ -380,8 +461,9 @@ docker compose -f nerdctl-compose.public.yml up -d
 The public facing server should then be available, e.g., via
 
 ```bash
-curl http://<server-ip>/health
-curl -X POST http://<server-ip>/jobs/ ...
+curl https://<configured-domain>/health/live
+curl https://<configured-domain>/health/ready
+curl -X POST https://<configured-domain>/jobs/ ...
 ```
 
 # Documentation for maintainers
