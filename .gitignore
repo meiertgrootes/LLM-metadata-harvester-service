@@ -2,4 +2,10 @@ lima_apptainer_nerdctl.yaml
 
 __pycache__/
 *.pyc
-
+.env
+.env.*
+!.env.example
+certs/*.pem
+build/
+dist/
+*.egg-info/

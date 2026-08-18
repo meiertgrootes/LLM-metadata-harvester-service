@@ -1,6 +1,14 @@
 services:
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   postgres:
@@ -13,10 +21,22 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U harvester -d harvester"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.migrate
+    image: llm-metadata-harvester-service-migrate:prod
+    environment:
+      DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   api:
     build:
@@ -28,11 +48,26 @@ services:
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
+      WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-}
+      TASK_SECRET_KEY: ${TASK_SECRET_KEY:?Set TASK_SECRET_KEY to a Fernet key}
+      WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-5}
+      WEBHOOK_RETRY_BACKOFF: ${WEBHOOK_RETRY_BACKOFF:-2}
+      WEBHOOK_RETRY_AFTER_MAX_SECONDS: ${WEBHOOK_RETRY_AFTER_MAX_SECONDS:-300}
+      CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: ${CELERY_TASK_SOFT_TIME_LIMIT_SECONDS:-3300}
+      CELERY_TASK_TIME_LIMIT_SECONDS: ${CELERY_TASK_TIME_LIMIT_SECONDS:-3600}
+      CELERY_VISIBILITY_TIMEOUT_SECONDS: ${CELERY_VISIBILITY_TIMEOUT_SECONDS:-3900}
+      JOB_PENDING_STALE_SECONDS: ${JOB_PENDING_STALE_SECONDS:-4500}
     depends_on:
       redis:
-        condition: service_started
-      postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   worker:
@@ -45,11 +80,38 @@ services:
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
+      WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-}
+      TASK_SECRET_KEY: ${TASK_SECRET_KEY:?Set TASK_SECRET_KEY to a Fernet key}
+      WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-5}
+      WEBHOOK_RETRY_BACKOFF: ${WEBHOOK_RETRY_BACKOFF:-2}
+      WEBHOOK_RETRY_AFTER_MAX_SECONDS: ${WEBHOOK_RETRY_AFTER_MAX_SECONDS:-300}
+      CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: ${CELERY_TASK_SOFT_TIME_LIMIT_SECONDS:-3300}
+      CELERY_TASK_TIME_LIMIT_SECONDS: ${CELERY_TASK_TIME_LIMIT_SECONDS:-3600}
+      CELERY_VISIBILITY_TIMEOUT_SECONDS: ${CELERY_VISIBILITY_TIMEOUT_SECONDS:-3900}
+      JOB_MAX_EXECUTION_ATTEMPTS: ${JOB_MAX_EXECUTION_ATTEMPTS:-3}
+      JOB_PENDING_STALE_SECONDS: ${JOB_PENDING_STALE_SECONDS:-4500}
+      JOB_QUEUED_STALE_SECONDS: ${JOB_QUEUED_STALE_SECONDS:-86400}
     depends_on:
       redis:
-        condition: service_started
-      postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  beat:
+    image: llm-metadata-harvester-service-worker:prod
+    command: ["celery", "-A", "llm_metadata_harvester_service.core.celery_app.celery_app", "beat", "-l", "info", "--schedule", "/tmp/celerybeat-schedule"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
+      JOB_RECONCILE_INTERVAL_SECONDS: ${JOB_RECONCILE_INTERVAL_SECONDS:-60}
+      JOB_PENDING_STALE_SECONDS: ${JOB_PENDING_STALE_SECONDS:-4500}
+      JOB_QUEUED_STALE_SECONDS: ${JOB_QUEUED_STALE_SECONDS:-86400}
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   nginx:
@@ -59,8 +121,10 @@ services:
     volumes:
       - ./nginx/nginx.local.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   pgdata:
+  redisdata:
