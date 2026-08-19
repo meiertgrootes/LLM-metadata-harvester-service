@@ -18,6 +18,13 @@ def test_ephemeral_worker_configuration():
     assert outbox_schedule["schedule"] == 5
 
 
+def test_worker_loader_includes_all_task_modules():
+    assert set(celery_app.conf.include) == {
+        "llm_metadata_harvester_service.workers.tasks",
+        "llm_metadata_harvester_service.workers.webhook",
+    }
+
+
 def test_tasks_are_bound_to_service_app():
     assert run_harvester_task.app is celery_app
     assert deliver_job_webhook.app is celery_app

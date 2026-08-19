@@ -14,12 +14,10 @@ celery_app = Celery(
     # Results are persisted to PostgreSQL by the worker itself; no result
     # backend is used. Redis serves only as the broker (task queue).
     backend=None,
-)
-
-celery_app.autodiscover_tasks(
-    [
-        "llm_metadata_harvester_service.workers",
-    ]
+    include=[
+        "llm_metadata_harvester_service.workers.tasks",
+        "llm_metadata_harvester_service.workers.webhook",
+    ],
 )
 
 celery_app.conf.update(
