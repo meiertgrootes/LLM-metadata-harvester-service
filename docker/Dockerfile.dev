@@ -15,7 +15,9 @@ RUN apt-get update && apt-get install -y \
 
 # ---- llm-metadata-harvester (editable) ----
 WORKDIR /opt
-RUN git clone https://github.com/LTER-LIFE/llm-metadata-harvester.git \
+ARG HARVESTER_GIT_REF=main
+RUN git clone --depth 1 --branch "${HARVESTER_GIT_REF}" \
+        https://github.com/LTER-LIFE/llm-metadata-harvester.git \
     && pip install -e /opt/llm-metadata-harvester
 
 # ---- dev tooling ----

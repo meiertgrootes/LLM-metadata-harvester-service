@@ -39,6 +39,7 @@ services:
       dockerfile: docker/Dockerfile.dev
       args:
         EXTRAS: "api,runtime,dev"
+        HARVESTER_GIT_REF: ${HARVESTER_GIT_REF:-main}
     command: >
       uvicorn llm_metadata_harvester_service.main:app
       --host 0.0.0.0
@@ -77,6 +78,7 @@ services:
       dockerfile: docker/Dockerfile.dev
       args:
         EXTRAS: "runtime,dev"
+        HARVESTER_GIT_REF: ${HARVESTER_GIT_REF:-main}
     command: python -m llm_metadata_harvester_service.workers.watchfiles_celery
     volumes:
       - ./src:/app/src

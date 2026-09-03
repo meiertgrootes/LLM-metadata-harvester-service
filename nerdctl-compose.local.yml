@@ -42,6 +42,7 @@ services:
       dockerfile: docker/Dockerfile.api.local
       args:
         EXTRAS: "api,runtime"
+        HARVESTER_GIT_REF: ${HARVESTER_GIT_REF:-main}
     image: llm-metadata-harvester-service-api:prod
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -73,6 +74,7 @@ services:
       dockerfile: docker/Dockerfile.worker.local
       args:
         EXTRAS: "runtime"
+        HARVESTER_GIT_REF: ${HARVESTER_GIT_REF:-main}
     image: llm-metadata-harvester-service-worker:prod
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
