@@ -76,6 +76,105 @@ def test_run_harvest_success_writes_result_and_uses_plain_api_key(monkeypatch):
     assert _get_outbox(job_id) is None
 
 
+def test_legacy_harvester_warns_and_uses_all_fields(monkeypatch):
+    job_id = str(uuid.uuid4())
+    _add_job(job_id)
+    warnings = []
+
+    async def legacy_harvest(*, model_name, url, api_key):
+        return {"Title": "Example", "License": "Public domain"}
+
+    monkeypatch.setattr(tasks, "metadata_harvest", legacy_harvest)
+    monkeypatch.setattr(
+        tasks.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+    payload = tasks._run_harvest(
+        job_id,
+        model="gemini-3.5-flash-lite",
+        url="https://example.com",
+        api_key="ephemeral-key",
+        fields=["Title"],
+    )
+
+    assert payload["status"] == "success"
+    assert payload["result"] == {
+        "Title": "Example",
+        "License": "Public domain",
+    }
+    assert "does not support field selection" in payload["logs"]
+    assert "does not support field selection" in warnings[0]
+
+
+def test_candidate_harvester_receives_requested_fields(monkeypatch):
+    job_id = str(uuid.uuid4())
+    _add_job(job_id)
+    captured = {}
+
+    async def candidate_harvest(*, model_name, url, api_key, fields=None):
+        captured["fields"] = fields
+        return {"Title": "Example"}
+
+    monkeypatch.setattr(tasks, "metadata_harvest", candidate_harvest)
+    payload = tasks._run_harvest(
+        job_id,
+        model="gemini-3.5-flash-lite",
+        url="https://example.com",
+        api_key="ephemeral-key",
+        fields=["Title"],
+    )
+
+    assert payload["status"] == "success"
+    assert captured["fields"] == ["Title"]
+    assert "does not support field selection" not in payload["logs"]
+
+
+def test_candidate_harvester_defaults_to_all_fields(monkeypatch):
+    job_id = str(uuid.uuid4())
+    _add_job(job_id)
+    captured = {}
+
+    async def candidate_harvest(*, model_name, url, api_key, fields=None):
+        captured["fields"] = fields
+        return {"Title": "Example"}
+
+    monkeypatch.setattr(tasks, "metadata_harvest", candidate_harvest)
+    payload = tasks._run_harvest(
+        job_id,
+        model="gemini-3.5-flash-lite",
+        url="https://example.com",
+        api_key="ephemeral-key",
+    )
+
+    assert payload["status"] == "success"
+    assert captured["fields"] is None
+
+
+def test_candidate_internal_type_error_is_not_retried(monkeypatch):
+    job_id = str(uuid.uuid4())
+    _add_job(job_id)
+    calls = 0
+
+    async def candidate_harvest(*, model_name, url, api_key, fields=None):
+        nonlocal calls
+        calls += 1
+        raise TypeError("provider response was invalid")
+
+    monkeypatch.setattr(tasks, "metadata_harvest", candidate_harvest)
+    with pytest.raises(TypeError, match="provider response was invalid"):
+        tasks._run_harvest(
+            job_id,
+            model="gemini-3.5-flash-lite",
+            url="https://example.com",
+            api_key="ephemeral-key",
+            fields=["Title"],
+        )
+
+    assert calls == 1
+    assert _get_job(job_id).error == "harvest_failed"
+
+
 def test_success_creates_transactional_webhook_outbox(monkeypatch):
     job_id = str(uuid.uuid4())
     _add_job(job_id, webhook=True)

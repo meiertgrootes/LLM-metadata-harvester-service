@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -24,6 +25,11 @@ from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.db.status import TERMINAL_JOB_STATUSES, JobStatus
 
 logger = logging.getLogger(__name__)
+
+_FIELDS_UNSUPPORTED_WARNING = (
+    "Installed llm_metadata_harvester does not support field selection; "
+    "harvesting all fields."
+)
 
 
 def _payload_from_job(job: Job) -> dict[str, Any]:
@@ -130,6 +136,7 @@ def _run_harvest(
     model: str,
     url: str,
     api_key: str,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     attempt, existing_payload = _claim_job(job_id)
     if attempt is None:
@@ -139,9 +146,26 @@ def _run_harvest(
     result: dict[str, Any]
     try:
         with redirect_stdout(stdout_buffer):
-            result = asyncio.run(
-                metadata_harvest(model_name=model, url=url, api_key=api_key)
-            )
+            harvest_kwargs: dict[str, Any] = {
+                "model_name": model,
+                "url": url,
+                "api_key": api_key,
+            }
+            if fields is not None:
+                try:
+                    supports_fields = (
+                        "fields" in inspect.signature(metadata_harvest).parameters
+                    )
+                except (TypeError, ValueError):
+                    supports_fields = False
+
+                if supports_fields:
+                    harvest_kwargs["fields"] = fields
+                else:
+                    logger.warning("Job %s: %s", job_id, _FIELDS_UNSUPPORTED_WARNING)
+                    print(f"WARNING: {_FIELDS_UNSUPPORTED_WARNING}")
+
+            result = asyncio.run(metadata_harvest(**harvest_kwargs))
     except SoftTimeLimitExceeded:
         error_logs = stdout_buffer.getvalue() + "\n" + traceback.format_exc()
         _complete_job(
@@ -195,12 +219,14 @@ def run_harvester_task(
     model: str,
     url: str,
     api_key: str,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     return _run_harvest(
         self.request.id,
         model=model,
         url=url,
         api_key=api_key,
+        fields=fields,
     )
 
 
