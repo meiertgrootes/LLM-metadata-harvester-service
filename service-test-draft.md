@@ -65,6 +65,7 @@ export WEBHOOK_SECRET_KEY="$(
 export WEBHOOK_ALLOWED_HOSTS=host.docker.internal
 export JOB_RECONCILE_INTERVAL_SECONDS=5
 export JOB_QUEUED_STALE_SECONDS=15
+export HARVESTER_GIT_REF=main
 
 export MODEL=gemini-3.5-flash-lite
 export PROVIDER_API_KEY='<your-real-provider-api-key>'
@@ -85,6 +86,14 @@ docker compose -f nerdctl-compose.dev.yml ps
 
 The first build may take several minutes because it clones the harvester and
 installs Playwright.
+
+To test candidate field selection instead, set the candidate ref and rebuild
+the API and worker images before starting the stack:
+
+```bash
+export HARVESTER_GIT_REF=0.1.4
+docker compose -f nerdctl-compose.dev.yml build --no-cache api worker
+```
 
 Inspect startup and migration logs:
 
@@ -235,6 +244,42 @@ curl -sS "http://localhost/jobs/$JOB_ID/result" |
 A successful response includes `job_id`, `status`, `model`, `result`, and
 `logs`. If the job fails, inspect its stored logs and the worker logs before
 continuing.
+
+Submit a second job with a field subset:
+
+```bash
+FIELDS_RESPONSE="$(
+  curl -fsS -X POST http://localhost/jobs/ \
+    -H 'Content-Type: application/json' \
+    -H "X-API-Key: $PROVIDER_API_KEY" \
+    -d "{
+      \"model\":\"$MODEL\",
+      \"url\":\"https://example.com\",
+      \"fields\":[\"Title\",\"Description\",\"License\"]
+    }"
+)"
+
+printf '%s\n' "$FIELDS_RESPONSE" | python3 -m json.tool
+
+FIELDS_JOB_ID="$(
+  printf '%s' "$FIELDS_RESPONSE" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])'
+)"
+
+JOB_ID="$FIELDS_JOB_ID"
+```
+
+Repeat the polling and result-retrieval commands above using this updated
+`JOB_ID`.
+
+With `HARVESTER_GIT_REF=0.1.4`, the completed result should contain only the
+requested supported fields. With `HARVESTER_GIT_REF=main`, the service should
+complete a full-field harvest and include this compatibility warning in the
+job logs:
+
+```text
+Installed llm_metadata_harvester does not support field selection; harvesting all fields.
+```
 
 ## 9. Test batch processing
 

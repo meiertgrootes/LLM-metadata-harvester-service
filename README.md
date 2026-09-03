@@ -120,6 +120,10 @@ python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 Use the same key for API and worker, store it in a secret manager or local
 `.env`, and do not rotate it while undelivered outbox rows still exist.
 
+Container builds install the upstream harvester from `main` by default. Set
+`HARVESTER_GIT_REF` to a branch or tag before building to test another version,
+for example `HARVESTER_GIT_REF=0.1.4`.
+
 3. Shutdown
    The service can be shutdown with
 
@@ -156,6 +160,26 @@ which returns
 ```
 {"job_id":"1a62b30e-faaa-4641-b1d0-66081c162b2e","status":"queued"}
 ```
+
+An optional `fields` list limits extraction when the installed upstream
+harvester supports field selection:
+
+```bash
+curl -X POST "http://localhost/jobs/" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <InsertYourAPIKeyHere>" \
+  -d '{
+    "model": "gemini-3.5-flash-lite",
+    "url": "https://example.com",
+    "fields": ["Title", "Description", "License"]
+  }'
+```
+
+Omitting `fields` extracts the complete metadata standard. If `fields` is
+provided to an older harvester without that capability, the service performs a
+full-field harvest and records a compatibility warning in the worker and job
+logs. Field names are case-sensitive and are validated against the metadata
+standard by harvester versions that support field selection.
 
 2. Job status can be queried using the returned `job_id`
   ```
@@ -284,6 +308,7 @@ curl -X POST "http://localhost/jobs/batch/" \
       "https://example.org",
       "https://example.net"
     ],
+    "fields": ["Title", "Description", "License"],
     "webhook_url": "https://your-app.example.com/webhooks/metadata-harvest"
   }'
 ```
