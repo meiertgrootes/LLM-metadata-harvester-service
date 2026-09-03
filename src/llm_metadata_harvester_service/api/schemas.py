@@ -1,12 +1,16 @@
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, StringConstraints, field_validator
 
 from llm_metadata_harvester_service.core.config import BATCH_MAX_URLS
 from llm_metadata_harvester_service.core.webhook_security import (
     WebhookURLValidationError,
     validate_webhook_url,
 )
+
+MetadataFieldName = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)
+]
 
 # Job submission
 #=================
@@ -19,6 +23,11 @@ class JobSubmitRequest(BaseModel):
         ...,
         examples=["https://example.com or doi:10.5281/zenodo.12345"],
         description="URL, DOI, or other resolvable identifier",
+    )
+    fields: list[MetadataFieldName] | None = Field(
+        None,
+        min_length=1,
+        description="Optional metadata field names to extract",
     )
     webhook_url: HttpUrl | None = Field(
         None,
@@ -82,6 +91,11 @@ class BatchSubmitRequest(BaseModel):
         min_length=1,
         max_length=BATCH_MAX_URLS,
         description="List of URLs/DOIs to harvest; each URL becomes its own job",
+    )
+    fields: list[MetadataFieldName] | None = Field(
+        None,
+        min_length=1,
+        description="Optional metadata field names to extract from every URL",
     )
     webhook_url: HttpUrl | None = Field(
         None,

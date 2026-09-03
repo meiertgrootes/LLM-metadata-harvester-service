@@ -81,6 +81,37 @@ def test_submit_job_creates_row_and_enqueues(fake_runner):
         assert row.batch_id is None
 
 
+def test_submit_job_enqueues_requested_fields(fake_runner):
+    response = client.post(
+        "/jobs/",
+        json={
+            "model": "gemini-3.5-flash-lite",
+            "url": "https://example.com",
+            "fields": ["Title", "Description", "License"],
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert response.status_code == 202
+    _, kwargs = fake_runner.calls[0]
+    assert kwargs["fields"] == ["Title", "Description", "License"]
+
+
+@pytest.mark.parametrize("fields", [[], [""], ["   "]])
+def test_submit_job_rejects_empty_fields(fields):
+    response = client.post(
+        "/jobs/",
+        json={
+            "model": "gemini-3.5-flash-lite",
+            "url": "https://example.com",
+            "fields": fields,
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert response.status_code == 422
+
+
 def test_submit_encrypts_webhook_secret(fake_runner):
     secret = "supersecretvalue123456"
     response = client.post(

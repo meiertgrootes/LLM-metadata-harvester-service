@@ -1,5 +1,6 @@
 import logging
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
@@ -29,13 +30,17 @@ def _enqueue(
     url: str,
     model: str,
     api_key: str,
+    fields: list[str] | None = None,
 ) -> None:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "url": url,
+        "api_key": api_key,
+    }
+    if fields is not None:
+        kwargs["fields"] = fields
     run_harvester_task.apply_async(
-        kwargs={
-            "model": model,
-            "url": url,
-            "api_key": api_key,
-        },
+        kwargs=kwargs,
         task_id=job_id,
     )
 
@@ -85,6 +90,7 @@ def submit_batch(
                 url=job.url,
                 model=payload.model,
                 api_key=x_api_key,
+                fields=payload.fields,
             )
         except Exception:
             logger.exception("failed to enqueue batch job %s", job.job_id)
@@ -143,6 +149,7 @@ def submit_job(
             url=payload.url,
             model=payload.model,
             api_key=x_api_key,
+            fields=payload.fields,
         )
     except Exception:
         logger.exception("failed to enqueue job %s", job_id)

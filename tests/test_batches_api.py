@@ -77,6 +77,23 @@ def test_submit_batch_creates_individual_jobs(fake_runner):
         assert {row.url for row in rows} == set(urls)
 
 
+def test_submit_batch_enqueues_fields_for_every_job(fake_runner):
+    fields = ["Title", "License"]
+    response = client.post(
+        "/jobs/batch/",
+        json={
+            "model": "gemini-3.5-flash-lite",
+            "urls": ["https://example.com", "https://example.org"],
+            "fields": fields,
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert response.status_code == 202
+    assert len(fake_runner.calls) == 2
+    assert all(kwargs["fields"] == fields for _, kwargs in fake_runner.calls)
+
+
 def test_submit_batch_rejects_empty():
     resp = client.post(
         "/jobs/batch/",
@@ -84,6 +101,20 @@ def test_submit_batch_rejects_empty():
         headers=API_KEY_HEADER,
     )
     assert resp.status_code == 422
+
+
+def test_submit_batch_rejects_empty_fields():
+    response = client.post(
+        "/jobs/batch/",
+        json={
+            "model": "gemini-3.5-flash-lite",
+            "urls": ["https://example.com"],
+            "fields": [],
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert response.status_code == 422
 
 
 def test_submit_batch_rejects_over_limit():
