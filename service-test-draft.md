@@ -182,7 +182,23 @@ curl -i -X POST http://localhost/jobs/ \
 ```
 
 A request containing a webhook secret shorter than 16 characters should also
-return HTTP `422`.
+return HTTP `422`. The destination below is allowed by `WEBHOOK_ALLOWED_HOSTS`,
+so the only problem is the 9-character secret:
+
+```bash
+curl -i -X POST http://localhost/jobs/ \
+  -H 'Content-Type: application/json' \
+  -H "X-API-Key: $PROVIDER_API_KEY" \
+  -d "{
+    \"model\":\"$MODEL\",
+    \"url\":\"https://example.com\",
+    \"webhook_url\":\"http://host.docker.internal:8080/\",
+    \"webhook_secret\":\"too-short\"
+  }"
+```
+
+The response body should name `webhook_secret` and say it needs at least 16
+characters. No job is created for any of the three requests in this step.
 
 ## 8. Test a single harvest
 
@@ -206,23 +222,36 @@ JOB_ID="$(
 printf 'JOB_ID=%s\n' "$JOB_ID"
 ```
 
-Poll until the job reaches a terminal state:
+Define a helper that polls a job until it reaches a terminal state
+(`success` or `failure`), giving up after about five minutes. It is reused in
+Step 11:
 
 ```bash
-while :; do
-  STATUS_RESPONSE="$(curl -fsS "http://localhost/jobs/$JOB_ID")"
-  printf '%s\n' "$STATUS_RESPONSE"
+wait_for_job() {
+  for _ in $(seq 1 150); do
+    STATUS_RESPONSE="$(curl -fsS "http://localhost/jobs/$1")"
+    printf '%s\n' "$STATUS_RESPONSE"
 
-  JOB_STATUS="$(
-    printf '%s' "$STATUS_RESPONSE" |
-      python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])'
-  )"
+    JOB_STATUS="$(
+      printf '%s' "$STATUS_RESPONSE" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])'
+    )"
 
-  case "$JOB_STATUS" in
-    success|failure) break ;;
-  esac
+    case "$JOB_STATUS" in
+      success|failure) return 0 ;;
+    esac
 
-  sleep 2
+    sleep 2
+  done
+  printf 'Timed out waiting for job %s\n' "$1" >&2
+  return 1
+}
+```
+
+Poll the job:
+
+```bash
+wait_for_job "$JOB_ID"
 ```
 
 Retrieve the result:
@@ -335,8 +364,15 @@ WEBHOOK_JOB_ID="$(
 printf '%s\n' "$WEBHOOK_RESPONSE" | python3 -m json.tool
 ```
 
-Wait for the harvest to reach `success` or `failure`. Because Beat is stopped,
-the outbox row should remain undelivered:
+The submission response always shows `"status": "queued"`; that only means
+the job was accepted. Wait for the harvest itself to finish:
+
+```bash
+wait_for_job "$WEBHOOK_JOB_ID"
+```
+
+The outbox row is created when the job finishes. Because Beat is stopped, it
+should remain undelivered:
 
 ```bash
 docker compose -f nerdctl-compose.dev.yml exec -T postgres \
