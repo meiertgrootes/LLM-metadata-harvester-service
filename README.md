@@ -73,6 +73,12 @@ re-publishes due outbox rows after Redis or worker recovery, and delivery tasks
 carry only a `job_id`. Receivers should remain idempotent because outbox
 delivery is at least once.
 
+Automated CI verifies the core API, persistence, queue, migration, batch, field
+selection, and webhook behavior. Administrators should use the
+[service deployment test suite](service-deployment-test-suite.md) for the
+smaller set of environment-specific checks that remain necessary after CI has
+passed.
+
 
 To run the service in local production mode users should follow the steps listed below
 1. Ensure either `Docker` or `nerdctl/containerd` is available on their system.
@@ -122,7 +128,9 @@ Use the same key for API and worker, store it in a secret manager or local
 
 Container builds install the upstream harvester from `main` by default. Set
 `HARVESTER_GIT_REF` to a branch or tag before building to test another version,
-for example `HARVESTER_GIT_REF=0.1.4`.
+for example `HARVESTER_GIT_REF=0.1.4`. The service detects whether the selected
+harvester supports explicit fields. Unsupported versions perform a full-field
+harvest and record a compatibility warning instead of failing the job.
 
 3. Shutdown
    The service can be shutdown with
@@ -365,6 +373,44 @@ nerdctl
 
   and shut down accordingly.
 
+## Automated tests and CI
+
+GitHub Actions runs `.github/workflows/ci.yml` on every push. It executes the
+fast test suite, Ruff, strict mypy, validates every Compose configuration, and
+runs the Docker-backed integration suite.
+
+Run the fast checks locally with Python 3.12:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install ".[api,runtime,dev]"
+
+pytest -q -m "not integration"
+ruff check src tests migrations scripts
+mypy src
+```
+
+Run the integration suite with Docker available:
+
+```bash
+docker compose -f docker-compose.test.yml config --quiet
+pytest -q tests/integration
+```
+
+The integration suite starts isolated PostgreSQL, Redis, API, worker, Beat, and
+webhook receiver containers. It uses a deterministic test harvester, so it does
+not require a provider API key or incur provider charges. It verifies real
+broker and database behavior, migrations, single and batch jobs, explicit field
+forwarding, durable webhook recovery, and reconciliation after transient task
+loss.
+
+The integration stack uses random host ports and a unique Compose project name,
+then removes its containers and volumes after the test session. See the
+[service deployment test suite](service-deployment-test-suite.md) for the exact
+boundary between automated coverage and checks that require a real deployment,
+provider, DNS, TLS, webhook receiver, and storage configuration.
+
 ## Database migrations
 
 Alembic owns the production schema. New deployments run `alembic upgrade head`
@@ -378,7 +424,11 @@ If a local/dev PostgreSQL volume was created before Alembic was introduced:
 - To preserve data, verify that the existing `jobs` table matches the schema
   introduced before Alembic, then run the migration image once with
   `alembic stamp 0001` followed by `alembic upgrade head`. Revision `0002` adds
-  the recovery column, constraint, and index. Back up the database first.
+  job recovery state. Revision `0003` adds the durable webhook outbox and
+  encrypted webhook-secret storage. Back up the database first.
+
+The expected current revision is `0003`. CI tests both a fresh PostgreSQL
+migration and an upgrade from the legacy `0001` schema.
 
 Some nerdctl versions do not enforce conditional `depends_on`. The safe fallback
 is to start PostgreSQL and Redis, run `migrate` explicitly, and then start the
@@ -409,7 +459,12 @@ docker compose -f nerdctl-compose.local.yml exec -T worker \
 --->
 
 # Documentation for public-facing deployment
-For public facing deployment a hardend mode is available. However, this mode requires some intial configuration before deployment is possible.
+For public-facing deployment a hardened mode is available. This mode requires
+configuration of credentials, TLS, DNS, firewall rules, and durable PostgreSQL
+storage before deployment. Review the
+[service deployment test suite](service-deployment-test-suite.md) before
+deploying; it distinguishes behavior already covered by CI from checks that
+must be performed against the target environment.
 
 ## Configure nginx
 Prior to deployment the nginx service must be configured. The `nginx.public.conf` file located at `/nginx/nginx.public.conf` must be edited. On lines 34-37
@@ -494,7 +549,49 @@ curl https://<configured-domain>/health/ready
 curl -X POST https://<configured-domain>/jobs/ ...
 ```
 
+### 4. Validate the deployment
+
+Complete the administrator checks in the
+[service deployment test suite](service-deployment-test-suite.md) before
+accepting production traffic. In particular, verify:
+
+- The deployed commit or image has a successful GitHub Actions run.
+- Migrations completed at revision `0003` and health checks pass through the
+  public DNS and TLS endpoint.
+- The worker is connected to Redis and registered with all service tasks.
+- PostgreSQL uses the intended durable storage and backup policy while Redis
+  remains nonpersistent.
+- One real provider-backed harvest succeeds with the deployed harvester version.
+- Explicit field selection behaves as expected for that harvester version.
+- A signed webhook reaches an organization-controlled receiver through the
+  actual DNS, TLS, proxy, firewall, and egress path.
+
+The guide also identifies when provider, webhook, and destructive recovery
+checks need to be repeated after configuration or infrastructure changes.
+
 # Documentation for maintainers
-<!---
-- _notes on how to make a release_
---->
+
+Every pushed commit should complete the GitHub Actions workflow before it is
+merged or deployed. The workflow combines fast SQLite/memory-broker regression
+tests with a real PostgreSQL/Redis/Celery integration stack. Provider-backed
+compatibility remains a release or deployment check because CI deliberately
+uses a deterministic harvester stub.
+
+Before merging or releasing changes:
+
+1. Confirm the fast and Docker-backed CI checks pass.
+2. Add regression coverage for changed API, persistence, queue, migration, or
+   webhook behavior.
+3. Add an Alembic revision for schema changes and test both fresh and legacy
+   PostgreSQL upgrades.
+4. Keep provider API keys out of persisted state, test output, fixtures, and
+   logs.
+5. Keep Redis nonpersistent unless the credential-handling architecture is
+   deliberately redesigned and reviewed.
+6. Update the README and
+   [service deployment test suite](service-deployment-test-suite.md) when the
+   boundary between automated and administrator-run validation changes.
+
+When changing the upstream harvester ref, test both full-field behavior and an
+explicit field subset against the intended version. The deployment guide
+documents the current `main` fallback and `0.1.4` field-selection checks.
