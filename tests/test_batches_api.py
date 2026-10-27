@@ -94,6 +94,39 @@ def test_submit_batch_enqueues_fields_for_every_job(fake_runner):
     assert all(kwargs["fields"] == fields for _, kwargs in fake_runner.calls)
 
 
+def test_submit_batch_requires_api_key(fake_runner):
+    resp = client.post(
+        "/jobs/batch/",
+        json={"model": "gemini-2.5-flash", "urls": ["https://example.com"]},
+    )
+
+    assert resp.status_code == 422
+    assert fake_runner.calls == []
+    with SessionLocal() as db:
+        assert db.query(Job).count() == 0
+
+
+def test_submit_batch_rejects_short_webhook_secret(fake_runner):
+    resp = client.post(
+        "/jobs/batch/",
+        json={
+            "model": "gemini-2.5-flash",
+            "urls": ["https://example.com"],
+            "webhook_url": "https://receiver.example.com/hook",
+            "webhook_secret": "too-short",
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 422
+    error = resp.json()["detail"][0]
+    assert error["loc"] == ["body", "webhook_secret"]
+    assert error["type"] == "string_too_short"
+    assert fake_runner.calls == []
+    with SessionLocal() as db:
+        assert db.query(Job).count() == 0
+
+
 def test_submit_batch_rejects_empty():
     resp = client.post(
         "/jobs/batch/",

@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from llm_metadata_harvester_service.api import routes
+from llm_metadata_harvester_service.api.schemas import JobResultResponse
 from llm_metadata_harvester_service.db.models import Job
 from llm_metadata_harvester_service.db.session import SessionLocal
 from llm_metadata_harvester_service.main import app
@@ -110,6 +111,73 @@ def test_submit_job_rejects_empty_fields(fields):
     )
 
     assert response.status_code == 422
+
+
+def test_submit_job_requires_api_key(fake_runner):
+    resp = client.post(
+        "/jobs/",
+        json={"model": "gemini-2.5-flash", "url": "https://example.com"},
+    )
+
+    assert resp.status_code == 422
+    assert fake_runner.calls == []
+    with SessionLocal() as db:
+        assert db.query(Job).count() == 0
+
+
+def test_submit_job_rejects_private_webhook_url(fake_runner):
+    resp = client.post(
+        "/jobs/",
+        json={
+            "model": "gemini-2.5-flash",
+            "url": "https://example.com",
+            "webhook_url": "http://127.0.0.1/hook",
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 422
+    assert fake_runner.calls == []
+    with SessionLocal() as db:
+        assert db.query(Job).count() == 0
+
+
+def test_submit_job_rejects_short_webhook_secret_without_side_effects(fake_runner):
+    resp = client.post(
+        "/jobs/",
+        json={
+            "model": "gemini-2.5-flash",
+            "url": "https://example.com",
+            "webhook_url": "https://receiver.example.com/hook",
+            "webhook_secret": "1234567890abcde",
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 422
+    error = resp.json()["detail"][0]
+    assert error["loc"] == ["body", "webhook_secret"]
+    assert error["type"] == "string_too_short"
+    assert "16 characters" in error["msg"]
+    assert fake_runner.calls == []
+    with SessionLocal() as db:
+        assert db.query(Job).count() == 0
+
+
+def test_submit_job_accepts_sixteen_character_webhook_secret(fake_runner):
+    resp = client.post(
+        "/jobs/",
+        json={
+            "model": "gemini-2.5-flash",
+            "url": "https://example.com",
+            "webhook_url": "https://receiver.example.com/hook",
+            "webhook_secret": "1234567890abcdef",
+        },
+        headers=API_KEY_HEADER,
+    )
+
+    assert resp.status_code == 202
+    assert len(fake_runner.calls) == 1
 
 
 def test_submit_encrypts_webhook_secret(fake_runner):
@@ -221,8 +289,10 @@ def test_get_result_success():
     body = resp.json()
     assert body["job_id"] == job_id
     assert body["status"] == "success"
+    assert body["model"] == "gemini-2.5-flash"
     assert body["result"] == {"title": "Example"}
     assert body["logs"] == "done\n"
+    assert JobResultResponse.model_validate(body).model_dump() == body
 
 
 def test_get_result_failure_returns_500():
