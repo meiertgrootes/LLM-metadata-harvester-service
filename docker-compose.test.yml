@@ -1,0 +1,111 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: harvester
+      POSTGRES_PASSWORD: harvester
+      POSTGRES_DB: harvester
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.test
+    image: ${COMPOSE_PROJECT_NAME:-harvester-integration}-service-test
+    environment:
+      DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: ${COMPOSE_PROJECT_NAME:-harvester-integration}-service-test
+    environment: &service-environment
+      DATABASE_URL: postgresql+psycopg2://harvester:harvester@postgres:5432/harvester
+      CELERY_BROKER_URL: redis://redis:6379/0
+      WEBHOOK_SECRET_KEY: o1pxvABKy2_-zKRx2m60YhBvsRqGXTNgSbh7wAwmOPY=
+      WEBHOOK_ALLOWED_HOSTS: receiver
+      CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: "20"
+      CELERY_TASK_TIME_LIMIT_SECONDS: "30"
+      JOB_PENDING_STALE_SECONDS: "40"
+      JOB_QUEUED_STALE_SECONDS: "3"
+      JOB_RECONCILE_INTERVAL_SECONDS: "1"
+      WEBHOOK_OUTBOX_INTERVAL_SECONDS: "1"
+      WEBHOOK_OUTBOX_LEASE_SECONDS: "3"
+      WEBHOOK_RETRY_BACKOFF: "1"
+      HARVESTER_STUB_STATE: /test-state/calls.jsonl
+    volumes:
+      - teststate:/test-state
+    ports:
+      - "127.0.0.1::8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=2)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    image: ${COMPOSE_PROJECT_NAME:-harvester-integration}-service-test
+    command: ["celery", "-A", "llm_metadata_harvester_service.core.celery_app.celery_app", "worker", "-l", "info", "--concurrency", "1"]
+    environment: *service-environment
+    volumes:
+      - teststate:/test-state
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  beat:
+    image: ${COMPOSE_PROJECT_NAME:-harvester-integration}-service-test
+    command: ["celery", "-A", "llm_metadata_harvester_service.core.celery_app.celery_app", "beat", "-l", "info", "--schedule", "/tmp/celerybeat-schedule"]
+    environment: *service-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  receiver:
+    image: ${COMPOSE_PROJECT_NAME:-harvester-integration}-service-test
+    command: ["python", "/test-support/receiver.py"]
+    environment:
+      WEBHOOK_RECEIVER_SECRET: integration-webhook-secret
+      TEST_STATE_DIR: /test-state
+    volumes:
+      - teststate:/test-state
+    ports:
+      - "127.0.0.1::8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  teststate:

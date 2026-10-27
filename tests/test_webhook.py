@@ -201,6 +201,7 @@ def test_delivery_success_updates_outbox_and_job(monkeypatch):
     with SessionLocal() as db:
         row = db.get(WebhookOutbox, "delivery-ok")
         job = db.get(Job, "delivery-ok")
+        assert row.attempts == 1
         assert row.delivered_at is not None
         assert row.encrypted_secret is None
         assert job.webhook_delivered_at is not None

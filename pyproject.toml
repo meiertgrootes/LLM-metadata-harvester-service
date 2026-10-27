@@ -77,3 +77,12 @@ strict = true
 ignore_missing_imports = true
 # celery's task decorators ship no type stubs
 disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: tests requiring the Docker Compose integration stack",
+  "migration: database migration tests against PostgreSQL",
+  "smoke: deployed service and container configuration checks",
+  "e2e: end-to-end API, worker, and persistence checks",
+  "resilience: broker-loss and durable recovery checks",
+]

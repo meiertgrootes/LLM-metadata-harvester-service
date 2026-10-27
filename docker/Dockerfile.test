@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/test-support:/app/src \
+    HOME=/tmp
+
+WORKDIR /app
+
+# Dependency metadata is copied first so application changes retain this layer.
+COPY pyproject.toml README.md ./
+COPY src/llm_metadata_harvester_service ./src/llm_metadata_harvester_service
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install ".[api,runtime]"
+
+COPY alembic.ini ./
+COPY migrations ./migrations
+COPY tests/fixtures/llm_metadata_harvester /test-support/llm_metadata_harvester
+COPY tests/fixtures/receiver.py /test-support/receiver.py
+
+CMD ["uvicorn", "llm_metadata_harvester_service.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,5 +1,8 @@
 from llm_metadata_harvester_service.core.celery_app import celery_app
-from llm_metadata_harvester_service.workers.tasks import run_harvester_task
+from llm_metadata_harvester_service.workers.tasks import (
+    reconcile_stale_jobs,
+    run_harvester_task,
+)
 from llm_metadata_harvester_service.workers.webhook import (
     deliver_job_webhook,
     publish_pending_webhooks,
@@ -29,3 +32,24 @@ def test_tasks_are_bound_to_service_app():
     assert run_harvester_task.app is celery_app
     assert deliver_job_webhook.app is celery_app
     assert publish_pending_webhooks.app is celery_app
+
+
+def test_task_names_and_beat_registration_are_exact():
+    assert run_harvester_task.name == (
+        "llm_metadata_harvester_service.workers.tasks.run_harvester_task"
+    )
+    assert reconcile_stale_jobs.name == (
+        "llm_metadata_harvester_service.workers.tasks.reconcile_stale_jobs"
+    )
+    assert publish_pending_webhooks.name == (
+        "llm_metadata_harvester_service.workers.webhook.publish_pending_webhooks"
+    )
+    assert deliver_job_webhook.name == (
+        "llm_metadata_harvester_service.workers.webhook.deliver_job_webhook"
+    )
+    assert celery_app.conf.beat_schedule["reconcile-stale-jobs"]["task"] == (
+        reconcile_stale_jobs.name
+    )
+    assert celery_app.conf.beat_schedule["publish-pending-webhooks"]["task"] == (
+        publish_pending_webhooks.name
+    )

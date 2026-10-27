@@ -2,11 +2,15 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastapi.testclient import TestClient
 
 from llm_metadata_harvester_service.core.secrets import encrypt_webhook_secret
 from llm_metadata_harvester_service.db.models import Job, WebhookOutbox
 from llm_metadata_harvester_service.db.session import SessionLocal
+from llm_metadata_harvester_service.main import app
 from llm_metadata_harvester_service.workers import tasks
+
+client = TestClient(app)
 
 
 def _add_job(
@@ -97,6 +101,11 @@ def test_success_creates_transactional_webhook_outbox(monkeypatch):
     assert job.webhook_secret_encrypted is None
     assert outbox is not None
     assert outbox.event == "job.completed"
+    assert outbox.attempts == 0
+    assert outbox.published_at is None
+    assert outbox.delivery_started_at is None
+    assert outbox.delivered_at is None
+    assert outbox.exhausted_at is None
     assert "supersecretvalue123456" not in (outbox.encrypted_secret or "")
 
 
@@ -190,3 +199,7 @@ def test_reconcile_stale_jobs_creates_failure_outbox():
     assert _get_outbox("old-pending").event == "job.failed"
     assert _get_outbox("old-queued").event == "job.failed"
     assert _get_job("recent").status == "pending"
+
+    response = client.get("/jobs/old-queued/result")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "dispatch_lost"
